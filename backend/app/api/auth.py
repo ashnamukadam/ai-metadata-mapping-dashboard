@@ -3,8 +3,12 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
 from app.database.session import get_db
-from app.schemas.user import UserCreate
-from app.services.user_service import create_user, get_user_by_email
+from app.schemas.user import UserCreate, UserResponse, ForgotPassword
+from app.services.user_service import (
+    create_user,
+    get_user_by_email,
+    update_password,
+)
 from app.auth.password import verify_password
 from app.auth.jwt import create_access_token
 from app.auth.dependencies import get_current_user
@@ -15,7 +19,7 @@ router = APIRouter(
 )
 
 
-@router.post("/register")
+@router.post("/register", response_model=UserResponse)
 def register(user: UserCreate, db: Session = Depends(get_db)):
     existing_user = get_user_by_email(db, user.email)
 
@@ -25,9 +29,7 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
             detail="Email already registered"
         )
 
-    new_user = create_user(db, user)
-
-    return new_user
+    return create_user(db, user)
 
 
 @router.post("/login")
@@ -43,16 +45,17 @@ def login(
             detail="User not found"
         )
 
-    if not verify_password(form_data.password, db_user.password_hash):
+    if not verify_password(
+        form_data.password,
+        db_user.password_hash
+    ):
         raise HTTPException(
             status_code=401,
             detail="Incorrect password"
         )
 
     access_token = create_access_token(
-        data={
-            "sub": db_user.email
-        }
+        data={"sub": db_user.email}
     )
 
     return {
@@ -67,4 +70,33 @@ def get_me(current_user=Depends(get_current_user)):
         "id": current_user.id,
         "name": current_user.name,
         "email": current_user.email
+    }
+
+
+@router.post("/forgot-password")
+def forgot_password(
+    data: ForgotPassword,
+    db: Session = Depends(get_db)
+):
+    user = update_password(
+        db,
+        data.email,
+        data.new_password
+    )
+
+    if user is None:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    return {
+        "message": "Password updated successfully"
+    }
+
+
+@router.post("/logout")
+def logout(current_user=Depends(get_current_user)):
+    return {
+        "message": "Logged out successfully"
     }
