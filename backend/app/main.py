@@ -8,6 +8,9 @@ from app.api.database_connection import (
 from app.api.database_permission import (
     router as database_permission_router,
 )
+from app.api.metadata_extraction import (
+    router as metadata_extraction_router,
+)
 
 
 app = FastAPI(
@@ -20,6 +23,7 @@ app.include_router(auth_router)
 app.include_router(dashboard_router)
 app.include_router(database_connection_router)
 app.include_router(database_permission_router)
+app.include_router(metadata_extraction_router)
 
 
 @app.get("/")
