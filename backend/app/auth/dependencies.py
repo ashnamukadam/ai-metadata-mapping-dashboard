@@ -7,7 +7,8 @@ from app.config.settings import SECRET_KEY, ALGORITHM
 from app.database.session import get_db
 from app.services.user_service import get_user_by_email
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
 
 def get_current_user(
