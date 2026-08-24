@@ -11,6 +11,7 @@ from app.api.database_permission import (
 from app.api.metadata_extraction import (
     router as metadata_extraction_router,
 )
+from app.api.schema_viewer import router as schema_viewer_router
 
 
 app = FastAPI(
@@ -24,6 +25,7 @@ app.include_router(dashboard_router)
 app.include_router(database_connection_router)
 app.include_router(database_permission_router)
 app.include_router(metadata_extraction_router)
+app.include_router(schema_viewer_router)
 
 
 @app.get("/")
