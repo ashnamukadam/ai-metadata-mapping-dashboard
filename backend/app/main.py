@@ -12,6 +12,7 @@ from app.api.metadata_extraction import (
     router as metadata_extraction_router,
 )
 from app.api.schema_viewer import router as schema_viewer_router
+from app.api.business_mapping import router as business_mapping_router
 
 
 app = FastAPI(
@@ -26,6 +27,7 @@ app.include_router(database_connection_router)
 app.include_router(database_permission_router)
 app.include_router(metadata_extraction_router)
 app.include_router(schema_viewer_router)
+app.include_router(business_mapping_router)
 
 
 @app.get("/")
