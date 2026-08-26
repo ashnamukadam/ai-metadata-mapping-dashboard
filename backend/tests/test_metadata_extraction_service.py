@@ -590,5 +590,377 @@ class TestMetadataExtraction(unittest.TestCase):
             )
 
 
+    # ========================================================
+    # SQL SERVER — METADATA QUERY ONLY
+    # ========================================================
+
+    @patch("pyodbc.drivers")
+    @patch("pyodbc.connect")
+    def test_sqlserver_metadata_query_only(
+        self,
+        mock_connect,
+        mock_drivers,
+    ):
+
+        mock_drivers.return_value = [
+            "ODBC Driver 17 for SQL Server"
+        ]
+
+        mock_connection = MagicMock()
+        mock_cursor = MagicMock()
+
+        mock_connect.return_value = mock_connection
+        mock_connection.cursor.return_value = mock_cursor
+
+        mock_cursor.fetchall.side_effect = [
+            # TABLES / VIEWS
+            [
+                ("dbo", "Customer", "BASE TABLE"),
+                ("dbo", "Invoice", "BASE TABLE"),
+            ],
+            # COLUMNS — Customer
+            [
+                ("CustomerID", "int", "NO", None),
+                ("Name", "varchar", "YES", None),
+            ],
+            # IDENTITY — Customer
+            [
+                ("CustomerID",),
+            ],
+            # PRIMARY KEY — Customer
+            [
+                ("CustomerID",),
+            ],
+            # FOREIGN KEYS — Customer
+            [],
+            # INDEXES — Customer
+            [],
+            # COLUMNS — Invoice
+            [
+                ("InvoiceID", "int", "NO", None),
+                ("CustomerID", "int", "NO", None),
+                ("InvoiceNo", "varchar", "NO", None),
+                ("TotalAmount", "decimal", "YES", None),
+            ],
+            # IDENTITY — Invoice
+            [
+                ("InvoiceID",),
+            ],
+            # PRIMARY KEY — Invoice
+            [
+                ("InvoiceID",),
+            ],
+            # FOREIGN KEYS — Invoice
+            [
+                (
+                    "FK_Invoice_Customer",
+                    "CustomerID",
+                    "dbo",
+                    "Customer",
+                    "CustomerID",
+                ),
+            ],
+            # INDEXES — Invoice
+            [
+                (
+                    "IX_Invoice_CustomerID",
+                    "CustomerID",
+                    False,
+                ),
+            ],
+        ]
+
+        connection_request = MagicMock()
+
+        connection_request.database_type = "sqlserver"
+        connection_request.database_name = "SalesDB"
+        connection_request.host = "localhost"
+        connection_request.port = 1433
+        connection_request.username = "test"
+        connection_request.password = "test"
+
+        result = extract_database_metadata(
+            connection_request
+        )
+
+        self.assertEqual(
+            result["database_type"],
+            "sqlserver",
+        )
+
+        self.assertEqual(
+            result["database_name"],
+            "SalesDB",
+        )
+
+        table_names = {
+            table["name"]
+            for table in result["tables"]
+        }
+
+        self.assertEqual(
+            table_names,
+            {
+                "Customer",
+                "Invoice",
+            },
+        )
+
+        invoice = next(
+            table
+            for table in result["tables"]
+            if table["name"] == "Invoice"
+        )
+
+        self.assertIn(
+            "InvoiceID",
+            invoice["primary_keys"],
+        )
+
+        self.assertTrue(
+            any(
+                fk["column"] == "CustomerID"
+                and fk["referenced_table"] == "Customer"
+                and fk["referenced_column"] == "CustomerID"
+                for fk in invoice["foreign_keys"]
+            )
+        )
+
+        self.assertTrue(
+            any(
+                "CustomerID" in index["columns"]
+                for index in invoice["indexes"]
+            )
+        )
+
+        invoice_id = next(
+            column
+            for column in invoice["columns"]
+            if column["name"] == "InvoiceID"
+        )
+
+        self.assertTrue(
+            invoice_id["primary_key"]
+        )
+
+        self.assertTrue(
+            invoice_id["auto_increment"]
+        )
+
+        queries = [
+            call.args[0]
+            for call in mock_cursor.execute.call_args_list
+        ]
+
+        for query in queries:
+
+            self.assertNotIn(
+                "SELECT *",
+                query.upper(),
+            )
+
+        mock_connection.close.assert_called_once()
+
+
+    # ========================================================
+    # ORACLE — METADATA QUERY ONLY
+    # ========================================================
+
+    @patch("oracledb.connect")
+    @patch("oracledb.makedsn")
+    def test_oracle_metadata_query_only(
+        self,
+        mock_makedsn,
+        mock_connect,
+    ):
+
+        mock_makedsn.return_value = (
+            "oracle-dsn"
+        )
+
+        mock_connection = MagicMock()
+        mock_cursor = MagicMock()
+
+        mock_connect.return_value = mock_connection
+        mock_connection.cursor.return_value = mock_cursor
+
+        mock_cursor.fetchall.side_effect = [
+            # TABLES
+            [
+                ("CUSTOMER",),
+                ("INVOICE",),
+            ],
+            # VIEWS
+            [
+                ("CUSTOMER_INVOICES",),
+            ],
+            # COLUMNS — CUSTOMER
+            [
+                ("CUSTOMERID", "NUMBER", "N", None),
+                ("NAME", "VARCHAR2", "Y", None),
+            ],
+            # PRIMARY KEY — CUSTOMER
+            [
+                ("CUSTOMERID",),
+            ],
+            # IDENTITY — CUSTOMER
+            [
+                ("CUSTOMERID",),
+            ],
+            # FOREIGN KEYS — CUSTOMER
+            [],
+            # INDEXES — CUSTOMER
+            [],
+            # COLUMNS — INVOICE
+            [
+                ("INVOICEID", "NUMBER", "N", None),
+                ("CUSTOMERID", "NUMBER", "N", None),
+                ("INVOICENO", "VARCHAR2", "N", None),
+                ("TOTALAMOUNT", "NUMBER", "Y", None),
+            ],
+            # PRIMARY KEY — INVOICE
+            [
+                ("INVOICEID",),
+            ],
+            # IDENTITY — INVOICE
+            [
+                ("INVOICEID",),
+            ],
+            # FOREIGN KEYS — INVOICE
+            [
+                (
+                    "FK_INVOICE_CUSTOMER",
+                    "CUSTOMERID",
+                    "CUSTOMER",
+                    "CUSTOMERID",
+                ),
+            ],
+            # INDEXES — INVOICE
+            [
+                (
+                    "IX_INVOICE_CUSTOMERID",
+                    "CUSTOMERID",
+                    "NONUNIQUE",
+                ),
+            ],
+            # COLUMNS — CUSTOMER_INVOICES VIEW
+            [
+                ("INVOICEID", "NUMBER", "Y", None),
+                ("CUSTOMERID", "NUMBER", "Y", None),
+            ],
+            # PRIMARY KEY — VIEW
+            [],
+            # IDENTITY — VIEW
+            [],
+            # FOREIGN KEYS — VIEW
+            [],
+            # INDEXES — VIEW
+            [],
+        ]
+
+        connection_request = MagicMock()
+
+        connection_request.database_type = "oracle"
+        connection_request.database_name = "XE"
+        connection_request.host = "localhost"
+        connection_request.port = 1521
+        connection_request.username = "test"
+        connection_request.password = "test"
+
+        result = extract_database_metadata(
+            connection_request
+        )
+
+        self.assertEqual(
+            result["database_type"],
+            "oracle",
+        )
+
+        self.assertEqual(
+            result["database_name"],
+            "XE",
+        )
+
+        table_names = {
+            table["name"]
+            for table in result["tables"]
+        }
+
+        self.assertEqual(
+            table_names,
+            {
+                "CUSTOMER",
+                "INVOICE",
+            },
+        )
+
+        view_names = {
+            view["name"]
+            for view in result["views"]
+        }
+
+        self.assertIn(
+            "CUSTOMER_INVOICES",
+            view_names,
+        )
+
+        invoice = next(
+            table
+            for table in result["tables"]
+            if table["name"] == "INVOICE"
+        )
+
+        self.assertIn(
+            "INVOICEID",
+            invoice["primary_keys"],
+        )
+
+        self.assertTrue(
+            any(
+                fk["column"] == "CUSTOMERID"
+                and fk["referenced_table"] == "CUSTOMER"
+                and fk["referenced_column"] == "CUSTOMERID"
+                for fk in invoice["foreign_keys"]
+            )
+        )
+
+        invoice_id = next(
+            column
+            for column in invoice["columns"]
+            if column["name"] == "INVOICEID"
+        )
+
+        self.assertTrue(
+            invoice_id["primary_key"]
+        )
+
+        self.assertTrue(
+            invoice_id["auto_increment"]
+        )
+
+        queries = [
+            call.args[0]
+            for call in mock_cursor.execute.call_args_list
+        ]
+
+        for query in queries:
+
+            self.assertNotIn(
+                "SELECT *",
+                query.upper(),
+            )
+
+        mock_makedsn.assert_called_once_with(
+            "localhost",
+            1521,
+            service_name="XE",
+        )
+
+        mock_connect.assert_called_once()
+
+        mock_connection.close.assert_called_once()
+
+
+
 if __name__ == "__main__":
     unittest.main()

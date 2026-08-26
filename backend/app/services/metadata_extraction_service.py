@@ -524,6 +524,620 @@ def _extract_postgresql(connection: Any) -> dict[str, Any]:
             conn.close()
 
 
+
+# ============================================================
+# SQL SERVER
+# ============================================================
+
+def _extract_sqlserver(connection: Any) -> dict[str, Any]:
+
+    import pyodbc
+
+    conn = None
+
+    try:
+        drivers = pyodbc.drivers()
+
+        sql_driver = next(
+            (
+                driver
+                for driver in drivers
+                if "ODBC Driver 18 for SQL Server" in driver
+            ),
+            None,
+        )
+
+        if sql_driver is None:
+            sql_driver = next(
+                (
+                    driver
+                    for driver in drivers
+                    if "ODBC Driver 17 for SQL Server" in driver
+                ),
+                None,
+            )
+
+        if sql_driver is None:
+            raise ValueError(
+                "Microsoft ODBC Driver 17 or 18 for SQL Server is not installed."
+            )
+
+        connection_string = (
+            f"DRIVER={{{sql_driver}}};"
+            f"SERVER={connection.host},{connection.port};"
+            f"DATABASE={connection.database_name};"
+            f"UID={connection.username};"
+            f"PWD={connection.password};"
+            "TrustServerCertificate=yes;"
+            "Connection Timeout=5;"
+        )
+
+        conn = pyodbc.connect(connection_string)
+
+        cursor = conn.cursor()
+
+        metadata = DatabaseMetadata(
+            database_name=connection.database_name,
+            database_type="sqlserver",
+        )
+
+        # ----------------------------------------------------
+        # TABLES + VIEWS
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            SELECT
+                TABLE_SCHEMA,
+                TABLE_NAME,
+                TABLE_TYPE
+            FROM INFORMATION_SCHEMA.TABLES
+            ORDER BY TABLE_SCHEMA, TABLE_NAME
+            """
+        )
+
+        objects = cursor.fetchall()
+
+        for schema_name, object_name, object_type in objects:
+
+            table = TableMetadata(
+                name=object_name,
+                table_type=object_type,
+            )
+
+            # ------------------------------------------------
+            # COLUMNS
+            # ------------------------------------------------
+
+            cursor.execute(
+                """
+                SELECT
+                    COLUMN_NAME,
+                    DATA_TYPE,
+                    IS_NULLABLE,
+                    COLUMN_DEFAULT
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = ?
+                  AND TABLE_NAME = ?
+                ORDER BY ORDINAL_POSITION
+                """,
+                schema_name,
+                object_name,
+            )
+
+            for (
+                column_name,
+                data_type,
+                nullable,
+                default_value,
+            ) in cursor.fetchall():
+
+                constraints = []
+
+                if nullable == "NO":
+                    constraints.append("NOT NULL")
+
+                table.columns.append(
+                    ColumnMetadata(
+                        name=column_name,
+                        data_type=str(data_type),
+                        nullable=nullable == "YES",
+                        default=default_value,
+                        constraints=constraints,
+                    )
+                )
+
+            # ------------------------------------------------
+            # AUTO-INCREMENT / IDENTITY
+            # ------------------------------------------------
+
+            cursor.execute(
+                """
+                SELECT
+                    c.name
+                FROM sys.identity_columns c
+                INNER JOIN sys.tables t
+                    ON c.object_id = t.object_id
+                INNER JOIN sys.schemas s
+                    ON t.schema_id = s.schema_id
+                WHERE s.name = ?
+                  AND t.name = ?
+                """,
+                schema_name,
+                object_name,
+            )
+
+            identity_columns = {
+                row[0]
+                for row in cursor.fetchall()
+            }
+
+            for column in table.columns:
+
+                if column.name in identity_columns:
+
+                    column.auto_increment = True
+
+                    if "AUTO_INCREMENT" not in column.constraints:
+                        column.constraints.append(
+                            "AUTO_INCREMENT"
+                        )
+
+            # ------------------------------------------------
+            # PRIMARY KEYS
+            # ------------------------------------------------
+
+            cursor.execute(
+                """
+                SELECT
+                    kcu.COLUMN_NAME
+                FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+                    ON tc.CONSTRAINT_NAME =
+                       kcu.CONSTRAINT_NAME
+                    AND tc.TABLE_SCHEMA =
+                       kcu.TABLE_SCHEMA
+                    AND tc.TABLE_NAME =
+                       kcu.TABLE_NAME
+                WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                  AND tc.TABLE_SCHEMA = ?
+                  AND tc.TABLE_NAME = ?
+                ORDER BY kcu.ORDINAL_POSITION
+                """,
+                schema_name,
+                object_name,
+            )
+
+            primary_keys = [
+                row[0]
+                for row in cursor.fetchall()
+            ]
+
+            table.primary_keys = primary_keys
+
+            for column in table.columns:
+
+                if column.name in primary_keys:
+
+                    column.primary_key = True
+
+                    if "PRIMARY KEY" not in column.constraints:
+                        column.constraints.append(
+                            "PRIMARY KEY"
+                        )
+
+            # ------------------------------------------------
+            # FOREIGN KEYS
+            # ------------------------------------------------
+
+            cursor.execute(
+                """
+                SELECT
+                    fk.name,
+                    COL_NAME(
+                        fkc.parent_object_id,
+                        fkc.parent_column_id
+                    ),
+                    OBJECT_SCHEMA_NAME(
+                        fkc.referenced_object_id
+                    ),
+                    OBJECT_NAME(
+                        fkc.referenced_object_id
+                    ),
+                    COL_NAME(
+                        fkc.referenced_object_id,
+                        fkc.referenced_column_id
+                    )
+                FROM sys.foreign_keys fk
+                INNER JOIN sys.foreign_key_columns fkc
+                    ON fk.object_id = fkc.constraint_object_id
+                WHERE OBJECT_SCHEMA_NAME(
+                    fkc.parent_object_id
+                ) = ?
+                  AND OBJECT_NAME(
+                    fkc.parent_object_id
+                ) = ?
+                ORDER BY fk.name, fkc.constraint_column_id
+                """,
+                schema_name,
+                object_name,
+            )
+
+            for row in cursor.fetchall():
+
+                (
+                    constraint_name,
+                    column_name,
+                    referenced_schema,
+                    referenced_table,
+                    referenced_column,
+                ) = row
+
+                table.foreign_keys.append(
+                    ForeignKeyMetadata(
+                        column=column_name,
+                        referenced_table=referenced_table,
+                        referenced_column=referenced_column,
+                        constraint_name=constraint_name,
+                    )
+                )
+
+            # ------------------------------------------------
+            # INDEXES
+            # ------------------------------------------------
+
+            cursor.execute(
+                """
+                SELECT
+                    i.name,
+                    COL_NAME(
+                        ic.object_id,
+                        ic.column_id
+                    ),
+                    i.is_unique
+                FROM sys.indexes i
+                INNER JOIN sys.index_columns ic
+                    ON i.object_id = ic.object_id
+                    AND i.index_id = ic.index_id
+                INNER JOIN sys.tables t
+                    ON i.object_id = t.object_id
+                INNER JOIN sys.schemas s
+                    ON t.schema_id = s.schema_id
+                WHERE s.name = ?
+                  AND t.name = ?
+                  AND i.name IS NOT NULL
+                ORDER BY i.name, ic.key_ordinal
+                """,
+                schema_name,
+                object_name,
+            )
+
+            indexes = {}
+
+            for (
+                index_name,
+                column_name,
+                unique,
+            ) in cursor.fetchall():
+
+                if index_name not in indexes:
+                    indexes[index_name] = IndexMetadata(
+                        name=index_name,
+                        unique=bool(unique),
+                    )
+
+                if column_name:
+                    indexes[index_name].columns.append(
+                        column_name
+                    )
+
+            table.indexes = list(indexes.values())
+
+            if object_type == "VIEW":
+                metadata.views.append(table)
+            else:
+                metadata.tables.append(table)
+
+        cursor.close()
+
+        return _serialize_metadata(metadata)
+
+    finally:
+
+        if conn is not None:
+            conn.close()
+
+
+# ============================================================
+# ORACLE
+# ============================================================
+
+def _extract_oracle(connection: Any) -> dict[str, Any]:
+
+    import oracledb
+
+    conn = None
+
+    try:
+
+        dsn = oracledb.makedsn(
+            connection.host,
+            connection.port,
+            service_name=connection.database_name,
+        )
+
+        conn = oracledb.connect(
+            user=connection.username,
+            password=connection.password,
+            dsn=dsn,
+        )
+
+        cursor = conn.cursor()
+
+        metadata = DatabaseMetadata(
+            database_name=connection.database_name,
+            database_type="oracle",
+        )
+
+        # ----------------------------------------------------
+        # TABLES
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            SELECT TABLE_NAME
+            FROM USER_TABLES
+            ORDER BY TABLE_NAME
+            """
+        )
+
+        table_names = [
+            row[0]
+            for row in cursor.fetchall()
+        ]
+
+        # ----------------------------------------------------
+        # VIEWS
+        # ----------------------------------------------------
+
+        cursor.execute(
+            """
+            SELECT VIEW_NAME
+            FROM USER_VIEWS
+            ORDER BY VIEW_NAME
+            """
+        )
+
+        view_names = [
+            row[0]
+            for row in cursor.fetchall()
+        ]
+
+        all_objects = (
+            [(name, "TABLE") for name in table_names]
+            + [(name, "VIEW") for name in view_names]
+        )
+
+        for object_name, object_type in all_objects:
+
+            table = TableMetadata(
+                name=object_name,
+                table_type=object_type,
+            )
+
+            # ------------------------------------------------
+            # COLUMNS
+            # ------------------------------------------------
+
+            cursor.execute(
+                """
+                SELECT
+                    COLUMN_NAME,
+                    DATA_TYPE,
+                    NULLABLE,
+                    DATA_DEFAULT
+                FROM USER_TAB_COLUMNS
+                WHERE TABLE_NAME = :table_name
+                ORDER BY COLUMN_ID
+                """,
+                table_name=object_name,
+            )
+
+            for (
+                column_name,
+                data_type,
+                nullable,
+                default_value,
+            ) in cursor.fetchall():
+
+                constraints = []
+
+                if nullable == "N":
+                    constraints.append("NOT NULL")
+
+                table.columns.append(
+                    ColumnMetadata(
+                        name=column_name,
+                        data_type=str(data_type),
+                        nullable=nullable == "Y",
+                        default=default_value,
+                        constraints=constraints,
+                    )
+                )
+
+            # ------------------------------------------------
+            # PRIMARY KEYS
+            # ------------------------------------------------
+
+            cursor.execute(
+                """
+                SELECT
+                    acc.COLUMN_NAME
+                FROM USER_CONSTRAINTS ac
+                JOIN USER_CONS_COLUMNS acc
+                    ON ac.CONSTRAINT_NAME =
+                       acc.CONSTRAINT_NAME
+                WHERE ac.CONSTRAINT_TYPE = 'P'
+                  AND ac.TABLE_NAME = :table_name
+                ORDER BY acc.POSITION
+                """,
+                table_name=object_name,
+            )
+
+            primary_keys = [
+                row[0]
+                for row in cursor.fetchall()
+            ]
+
+            table.primary_keys = primary_keys
+
+            for column in table.columns:
+
+                if column.name in primary_keys:
+
+                    column.primary_key = True
+
+                    if "PRIMARY KEY" not in column.constraints:
+                        column.constraints.append(
+                            "PRIMARY KEY"
+                        )
+
+            # ------------------------------------------------
+            # IDENTITY COLUMNS
+            # ------------------------------------------------
+
+            cursor.execute(
+                """
+                SELECT
+                    COLUMN_NAME
+                FROM USER_TAB_IDENTITY_COLS
+                WHERE TABLE_NAME = :table_name
+                """,
+                table_name=object_name,
+            )
+
+            identity_columns = {
+                row[0]
+                for row in cursor.fetchall()
+            }
+
+            for column in table.columns:
+
+                if column.name in identity_columns:
+
+                    column.auto_increment = True
+
+                    if "AUTO_INCREMENT" not in column.constraints:
+                        column.constraints.append(
+                            "AUTO_INCREMENT"
+                        )
+
+            # ------------------------------------------------
+            # FOREIGN KEYS
+            # ------------------------------------------------
+
+            cursor.execute(
+                """
+                SELECT
+                    ac.CONSTRAINT_NAME,
+                    acc.COLUMN_NAME,
+                    ac_r.TABLE_NAME,
+                    acc_r.COLUMN_NAME
+                FROM USER_CONSTRAINTS ac
+                JOIN USER_CONS_COLUMNS acc
+                    ON ac.CONSTRAINT_NAME =
+                       acc.CONSTRAINT_NAME
+                JOIN USER_CONSTRAINTS ac_r
+                    ON ac.R_CONSTRAINT_NAME =
+                       ac_r.CONSTRAINT_NAME
+                JOIN USER_CONS_COLUMNS acc_r
+                    ON ac_r.CONSTRAINT_NAME =
+                       acc_r.CONSTRAINT_NAME
+                    AND acc.POSITION =
+                        acc_r.POSITION
+                WHERE ac.CONSTRAINT_TYPE = 'R'
+                  AND ac.TABLE_NAME = :table_name
+                ORDER BY ac.CONSTRAINT_NAME,
+                         acc.POSITION
+                """,
+                table_name=object_name,
+            )
+
+            for row in cursor.fetchall():
+
+                (
+                    constraint_name,
+                    column_name,
+                    referenced_table,
+                    referenced_column,
+                ) = row
+
+                table.foreign_keys.append(
+                    ForeignKeyMetadata(
+                        column=column_name,
+                        referenced_table=referenced_table,
+                        referenced_column=referenced_column,
+                        constraint_name=constraint_name,
+                    )
+                )
+
+            # ------------------------------------------------
+            # INDEXES
+            # ------------------------------------------------
+
+            cursor.execute(
+                """
+                SELECT
+                    ui.INDEX_NAME,
+                    uic.COLUMN_NAME,
+                    ui.UNIQUENESS
+                FROM USER_INDEXES ui
+                JOIN USER_IND_COLUMNS uic
+                    ON ui.INDEX_NAME =
+                       uic.INDEX_NAME
+                WHERE ui.TABLE_NAME = :table_name
+                ORDER BY ui.INDEX_NAME,
+                         uic.COLUMN_POSITION
+                """,
+                table_name=object_name,
+            )
+
+            indexes = {}
+
+            for (
+                index_name,
+                column_name,
+                uniqueness,
+            ) in cursor.fetchall():
+
+                if index_name not in indexes:
+                    indexes[index_name] = IndexMetadata(
+                        name=index_name,
+                        unique=uniqueness == "UNIQUE",
+                    )
+
+                if column_name:
+                    indexes[index_name].columns.append(
+                        column_name
+                    )
+
+            table.indexes = list(indexes.values())
+
+            if object_type == "VIEW":
+                metadata.views.append(table)
+            else:
+                metadata.tables.append(table)
+
+        cursor.close()
+
+        return _serialize_metadata(metadata)
+
+    finally:
+
+        if conn is not None:
+            conn.close()
+
+
 # ============================================================
 # SQLITE
 # ============================================================
@@ -1085,6 +1699,12 @@ def extract_database_metadata(
 
         if database_type == "postgresql":
             return _extract_postgresql(connection)
+
+        if database_type == "sqlserver":
+            return _extract_sqlserver(connection)
+
+        if database_type == "oracle":
+            return _extract_oracle(connection)
 
         if database_type == "sqlite":
             return _extract_sqlite(connection)
