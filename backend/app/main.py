@@ -16,6 +16,7 @@ from app.api.business_mapping import router as business_mapping_router
 from app.api.column_mapping import router as column_mapping_router
 from app.api.relationship import router as relationship_router
 from app.api.ai_prompt_preview import router as ai_prompt_preview_router
+from app.api.export_mapping import router as export_mapping_router
 
 
 app = FastAPI(
@@ -34,6 +35,7 @@ app.include_router(business_mapping_router)
 app.include_router(column_mapping_router)
 app.include_router(relationship_router)
 app.include_router(ai_prompt_preview_router)
+app.include_router(export_mapping_router)
 
 
 
