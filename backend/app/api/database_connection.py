@@ -1,8 +1,11 @@
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
+from app.database.session import get_db
+from app.models.database_connection import DatabaseConnection
 from app.schemas.database_connection import DatabaseConnectionRequest
 from app.services.database_connection_service import (
     check_database_connection,
@@ -24,30 +27,65 @@ router = APIRouter(
 def connect_database(
     connection: DatabaseConnectionRequest,
     current_user: Any = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
     Test connectivity to a supported database.
 
-    This endpoint is protected by JWT authentication.
-    Credentials are never returned in the response.
+    Credentials are used only for the connection attempt.
+    They are never persisted or returned.
     """
 
     try:
         result = check_database_connection(connection)
 
-        # The service returns a standardized result.
-        if isinstance(result, dict):
-            return result
+        connected = (
+            result.connected
+            if hasattr(result, "connected")
+            else bool(result)
+        )
+
+        database_name = (
+            getattr(connection, "database_name", None)
+            or getattr(connection, "keyspace", None)
+            or "N/A"
+        )
+
+        # Save only non-sensitive connection metadata.
+        if connected:
+            existing = (
+                db.query(DatabaseConnection)
+                .filter(
+                    DatabaseConnection.user_id == current_user.id,
+                    DatabaseConnection.database_name == database_name,
+                    DatabaseConnection.database_type
+                    == connection.database_type,
+                )
+                .first()
+            )
+
+            if existing is None:
+                existing = DatabaseConnection(
+                    user_id=current_user.id,
+                    database_type=connection.database_type,
+                    database_name=database_name,
+                    connected=True,
+                )
+                db.add(existing)
+            else:
+                existing.connected = True
+
+            db.commit()
 
         return {
-            "message": "Database connection test completed.",
-            "database_type": getattr(connection, "database_type", "unknown"),
-            "database_name": (
-                getattr(connection, "database_name", None)
-                or getattr(connection, "keyspace", None)
-                or "N/A"
+            "message": (
+                result.message
+                if hasattr(result, "message")
+                else "Database connection test completed."
             ),
-            "connected": bool(result),
+            "database_type": connection.database_type,
+            "database_name": database_name,
+            "connected": connected,
         }
 
     except ValueError as exc:
@@ -63,7 +101,8 @@ def connect_database(
         ) from exc
 
     except Exception as exc:
-        # Do not expose stack traces or credentials to the client.
+        db.rollback()
+
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Database connection test failed.",
@@ -77,12 +116,13 @@ def connect_database(
 async def connect_firebase(
     file: UploadFile = File(...),
     current_user: Any = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Test Firebase Firestore connectivity using a Firebase
-    service-account JSON file.
+    Test Firebase Firestore connectivity.
 
-    The uploaded credentials are never returned or logged.
+    The service-account credentials are used only for the
+    connection attempt and are never persisted.
     """
 
     if not file.filename:
@@ -91,7 +131,6 @@ async def connect_firebase(
             detail="A Firebase service-account JSON file is required.",
         )
 
-    # Basic file-type validation.
     if not file.filename.lower().endswith(".json"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -107,23 +146,63 @@ async def connect_firebase(
                 detail="The uploaded Firebase JSON file is empty.",
             )
 
-        # Parse and validate without exposing the contents.
         service_account = parse_firebase_service_account(contents)
 
-        result = test_firebase_connection(service_account)
+        result = test_firebase_connection(
+            service_account
+        )
 
-        if isinstance(result, dict):
-            return result
+        connected = (
+            result.connected
+            if hasattr(result, "connected")
+            else bool(result)
+        )
+
+        database_name = (
+            service_account.get(
+                "project_id",
+                "firestore",
+            )
+        )
+
+        if connected:
+            existing = (
+                db.query(DatabaseConnection)
+                .filter(
+                    DatabaseConnection.user_id == current_user.id,
+                    DatabaseConnection.database_type == "firebase",
+                    DatabaseConnection.database_name
+                    == database_name,
+                )
+                .first()
+            )
+
+            if existing is None:
+                existing = DatabaseConnection(
+                    user_id=current_user.id,
+                    database_type="firebase",
+                    database_name=database_name,
+                    connected=True,
+                )
+                db.add(existing)
+            else:
+                existing.connected = True
+
+            db.commit()
 
         return {
             "message": (
-                "Firebase Firestore connection successful."
-                if result
-                else "Firebase Firestore connection failed."
+                result.message
+                if hasattr(result, "message")
+                else (
+                    "Firebase Firestore connection successful."
+                    if connected
+                    else "Firebase Firestore connection failed."
+                )
             ),
             "database_type": "firebase",
-            "database_name": "firestore",
-            "connected": bool(result),
+            "database_name": database_name,
+            "connected": connected,
         }
 
     except HTTPException:
@@ -142,8 +221,51 @@ async def connect_firebase(
         ) from exc
 
     except Exception as exc:
-        # Never return Firebase credentials or raw credential payloads.
+        db.rollback()
+
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Firebase Firestore connection test failed.",
         ) from exc
+
+
+@router.delete(
+    "/disconnect/{connection_id}",
+    status_code=status.HTTP_200_OK,
+)
+def disconnect_database(
+    connection_id: int,
+    current_user: Any = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Disconnect a previously registered database.
+
+    Only the authenticated user's connection metadata is removed.
+
+    No database credentials are stored by this application,
+    so there are no credentials to retain after disconnect.
+    """
+
+    connection = (
+        db.query(DatabaseConnection)
+        .filter(
+            DatabaseConnection.id == connection_id,
+            DatabaseConnection.user_id == current_user.id,
+        )
+        .first()
+    )
+
+    if connection is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Database connection not found.",
+        )
+
+    db.delete(connection)
+    db.commit()
+
+    return {
+        "message": "Database disconnected successfully.",
+        "connection_id": connection_id,
+    }

@@ -1,9 +1,10 @@
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
+from app.database.session import get_db
 from app.schemas.ai_prompt_preview import (
     AIPromptPreviewRequest,
     AIPromptPreviewResponse,
@@ -27,22 +28,24 @@ router = APIRouter(
 def create_ai_prompt_preview(
     request: AIPromptPreviewRequest,
     current_user: Any = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
     Generate a deterministic AI prompt preview.
 
     No AI model is used.
-    No database records are accessed.
-    No business data is read or stored.
+    No database business records are accessed.
     """
 
     try:
-        preview = generate_ai_prompt_preview(request)
+        preview = generate_ai_prompt_preview(
+            request=request,
+            db=db,
+            user_id=current_user.id,
+        )
 
         return {
-            "message": (
-                "AI prompt preview generated successfully."
-            ),
+            "message": "AI prompt preview generated successfully.",
             "preview": preview,
         }
 

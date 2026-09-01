@@ -1,43 +1,81 @@
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
 from app.schemas.dashboard import DashboardResponse
 
 
-
-def get_connected_databases() -> int:
+def get_dashboard_data(
+    db: Session,
+    user_id: int,
+) -> DashboardResponse:
     """
-    Returns total connected databases.
-    Will query PostgreSQL in Module 3.
+    Return dashboard statistics for the authenticated user.
+
+    This service only reads application metadata/mapping
+    information. It never reads customer/business records.
     """
-    return 0
 
+    # These imports are kept inside the function so the service
+    # remains compatible while the persistence models are added.
+    from app.models.database_connection import DatabaseConnection
+    from app.models.metadata_table import MetadataTable
+    from app.models.business_mapping import BusinessMapping
 
-def get_last_mapping_date():
-    """
-    Returns latest mapping date.
-    Will query mappings table in Module 7.
-    """
-    return None
+    connected_databases = (
+        db.query(func.count(DatabaseConnection.id))
+        .filter(
+            DatabaseConnection.user_id == user_id,
+            DatabaseConnection.connected.is_(True),
+        )
+        .scalar()
+        or 0
+    )
 
+    total_tables = (
+        db.query(func.count(MetadataTable.id))
+        .filter(
+            MetadataTable.user_id == user_id,
+        )
+        .scalar()
+        or 0
+    )
 
-def get_total_tables() -> int:
-    """
-    Returns total extracted tables.
-    Will query metadata tables in Module 5.
-    """
-    return 0
+    total_mapped_tables = (
+        db.query(func.count(BusinessMapping.id))
+        .filter(
+            BusinessMapping.user_id == user_id,
+        )
+        .scalar()
+        or 0
+    )
 
+    last_mapping = (
+        db.query(BusinessMapping.created_at)
+        .filter(
+            BusinessMapping.user_id == user_id,
+        )
+        .order_by(
+            BusinessMapping.created_at.desc()
+        )
+        .first()
+    )
 
-def get_total_mapped_tables() -> int:
-    """
-    Returns total mapped tables.
-    Will query business mappings in Module 7.
-    """
-    return 0
+    last_mapping_date: Optional[str] = None
 
+    if last_mapping and last_mapping[0]:
+        value = last_mapping[0]
 
-def get_dashboard_data() -> DashboardResponse:
+        if isinstance(value, datetime):
+            last_mapping_date = value.isoformat()
+        else:
+            last_mapping_date = str(value)
+
     return DashboardResponse(
-        connected_databases=get_connected_databases(),
-        last_mapping_date=get_last_mapping_date(),
-        total_tables=get_total_tables(),
-        total_mapped_tables=get_total_mapped_tables()
+        connected_databases=connected_databases,
+        last_mapping_date=last_mapping_date,
+        total_tables=total_tables,
+        total_mapped_tables=total_mapped_tables,
     )

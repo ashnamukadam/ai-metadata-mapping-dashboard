@@ -1,17 +1,27 @@
-from typing import Any, Dict
+import json
+from typing import Any, Dict, Optional
 
+from sqlalchemy.orm import Session
+
+from app.models.business_mapping import BusinessMapping
+from app.models.database_connection import DatabaseConnection
 from app.schemas.business_mapping import BusinessMappingRequest
 
 
 def create_business_mapping(
     request: BusinessMappingRequest,
     schema_metadata: Dict[str, Any],
+    db: Optional[Session] = None,
+    user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Validate and create a business mapping for a database table.
 
     The mapping is created only against schema metadata.
     No business records are accessed or stored.
+
+    When db and user_id are supplied, the validated mapping is
+    also persisted in the application's metadata database.
     """
 
     database_name = request.database_name
@@ -35,7 +45,6 @@ def create_business_mapping(
     target_table = None
 
     for table in tables:
-        # Module 5 uses "name" for the table name.
         if table.get("name") == table_name:
             target_table = table
             break
@@ -64,7 +73,6 @@ def create_business_mapping(
     }
 
     for field_name, column_name in selected_fields.items():
-
         if column_name is not None and column_name not in columns:
             raise ValueError(
                 f"{field_name} '{column_name}' does not exist "
@@ -99,5 +107,95 @@ def create_business_mapping(
         "customer_reference": request.customer_reference,
         "description": request.description,
     }
+
+    # --------------------------------------------------------
+    # OPTIONAL PERSISTENCE
+    # --------------------------------------------------------
+    #
+    # Existing callers/tests can continue calling the service
+    # without db/user_id.
+    #
+    # When called by the authenticated API with db + user_id,
+    # the mapping is stored in OUR application database only.
+    #
+    # No customer/business records are stored.
+
+    if db is not None and user_id is not None:
+
+        database_connection = (
+            db.query(DatabaseConnection)
+            .filter(
+                DatabaseConnection.user_id == user_id,
+                DatabaseConnection.database_name == database_name,
+            )
+            .order_by(
+                DatabaseConnection.created_at.desc()
+            )
+            .first()
+        )
+
+        if database_connection is None:
+            raise ValueError(
+                "Database connection was not found for this user."
+            )
+
+        existing_mapping = (
+            db.query(BusinessMapping)
+            .filter(
+                BusinessMapping.user_id == user_id,
+                BusinessMapping.database_connection_id
+                == database_connection.id,
+                BusinessMapping.table_name == table_name,
+            )
+            .first()
+        )
+
+        if existing_mapping is None:
+            existing_mapping = BusinessMapping(
+                user_id=user_id,
+                database_connection_id=database_connection.id,
+                table_name=table_name,
+            )
+
+            db.add(existing_mapping)
+
+        existing_mapping.business_entity = (
+            request.business_entity
+        )
+
+        existing_mapping.table_purpose = (
+            request.table_purpose
+        )
+
+        existing_mapping.ai_aliases = json.dumps(
+            aliases
+        )
+
+        existing_mapping.primary_identifier = (
+            request.primary_identifier
+        )
+
+        existing_mapping.date_field = (
+            request.date_field
+        )
+
+        existing_mapping.amount_field = (
+            request.amount_field
+        )
+
+        existing_mapping.status_field = (
+            request.status_field
+        )
+
+        existing_mapping.customer_reference = (
+            request.customer_reference
+        )
+
+        existing_mapping.description = (
+            request.description
+        )
+
+        db.commit()
+        db.refresh(existing_mapping)
 
     return mapping

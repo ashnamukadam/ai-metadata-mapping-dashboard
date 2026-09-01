@@ -2,8 +2,10 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
+from app.database.session import get_db
 from app.schemas.business_mapping import (
     BusinessMappingRequest,
     BusinessMappingResponse,
@@ -32,28 +34,29 @@ class BusinessMappingWithMetadataRequest(BaseModel):
 def create_mapping(
     request: BusinessMappingWithMetadataRequest,
     current_user: Any = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
     Create and validate a business mapping using
     previously extracted database schema metadata.
 
-    Only schema metadata is used.
+    The validated mapping is persisted in the application's
+    metadata database.
 
-    No business records are read.
-    No SELECT * is performed.
-    No customer/business data is stored.
+    Only schema metadata is used.
+    No business records are read or stored.
     """
 
     try:
         mapping = create_business_mapping(
-            request.mapping,
-            request.schema_metadata,
+            request=request.mapping,
+            schema_metadata=request.schema_metadata,
+            db=db,
+            user_id=current_user.id,
         )
 
         return {
-            "message": (
-                "Business mapping created successfully."
-            ),
+            "message": "Business mapping created successfully.",
             "mapping": mapping,
         }
 

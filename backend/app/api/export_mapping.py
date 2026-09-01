@@ -2,10 +2,13 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response
+from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
+from app.database.session import get_db
 from app.schemas.export_mapping import ExportMappingRequest
 from app.services.export_mapping_service import (
+    build_export_mapping,
     generate_mapping_json,
     generate_mapping_txt,
 )
@@ -24,9 +27,10 @@ router = APIRouter(
 def export_mapping(
     request: ExportMappingRequest,
     current_user: Any = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Export metadata mapping as mapping.json or mapping.txt.
+    Export the authenticated user's persisted metadata mapping.
 
     Only mapping configuration is exported.
 
@@ -39,15 +43,19 @@ def export_mapping(
     """
 
     try:
+        # Build the export from persisted mappings.
+        persisted_mapping = build_export_mapping(
+            database=request.database,
+            db=db,
+            user_id=current_user.id,
+        )
 
-        # ----------------------------------------------------
-        # JSON EXPORT
-        # ----------------------------------------------------
+        # Preserve the format requested by the caller.
+        persisted_mapping.format = request.format
 
         if request.format == "json":
-
             content = generate_mapping_json(
-                request
+                persisted_mapping
             )
 
             return Response(
@@ -60,14 +68,9 @@ def export_mapping(
                 },
             )
 
-        # ----------------------------------------------------
-        # TEXT EXPORT
-        # ----------------------------------------------------
-
         if request.format == "txt":
-
             content = generate_mapping_txt(
-                request
+                persisted_mapping
             )
 
             return Response(

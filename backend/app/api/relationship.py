@@ -50,9 +50,7 @@ def create_relationship_mapping(
         )
 
         return {
-            "message": (
-                "Relationship created successfully."
-            ),
+            "message": "Relationship created successfully.",
             "relationship": relationship,
         }
 

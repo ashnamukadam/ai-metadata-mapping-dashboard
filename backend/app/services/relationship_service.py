@@ -1,17 +1,26 @@
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
+from sqlalchemy.orm import Session
+
+from app.models.database_connection import DatabaseConnection
+from app.models.relationship import Relationship
 from app.schemas.relationship import RelationshipRequest
 
 
 def create_relationship(
     request: RelationshipRequest,
     schema_metadata: Dict[str, Any],
+    db: Optional[Session] = None,
+    user_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Validate and create a relationship between two database columns.
 
     The relationship is created only against schema metadata.
     No business records are accessed or stored.
+
+    When db and user_id are supplied, the validated relationship
+    is persisted in the application's metadata database.
     """
 
     database_name = request.database_name
@@ -94,5 +103,60 @@ def create_relationship(
         "child_table": request.child_table,
         "child_column": request.child_column,
     }
+
+    # --------------------------------------------------------
+    # OPTIONAL PERSISTENCE
+    # --------------------------------------------------------
+
+    if db is not None and user_id is not None:
+
+        database_connection = (
+            db.query(DatabaseConnection)
+            .filter(
+                DatabaseConnection.user_id == user_id,
+                DatabaseConnection.database_name == database_name,
+            )
+            .order_by(
+                DatabaseConnection.created_at.desc()
+            )
+            .first()
+        )
+
+        if database_connection is None:
+            raise ValueError(
+                "Database connection was not found for this user."
+            )
+
+        existing_relationship = (
+            db.query(Relationship)
+            .filter(
+                Relationship.user_id == user_id,
+                Relationship.database_connection_id
+                == database_connection.id,
+                Relationship.parent_table
+                == request.parent_table,
+                Relationship.parent_column
+                == request.parent_column,
+                Relationship.child_table
+                == request.child_table,
+                Relationship.child_column
+                == request.child_column,
+            )
+            .first()
+        )
+
+        if existing_relationship is None:
+            existing_relationship = Relationship(
+                user_id=user_id,
+                database_connection_id=database_connection.id,
+                parent_table=request.parent_table,
+                parent_column=request.parent_column,
+                child_table=request.child_table,
+                child_column=request.child_column,
+            )
+
+            db.add(existing_relationship)
+            db.commit()
+            db.refresh(existing_relationship)
 
     return relationship
