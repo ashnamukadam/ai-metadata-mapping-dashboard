@@ -10,8 +10,11 @@ import {
 
 import NotificationsNoneIcon from "@mui/icons-material/NotificationsNone";
 import AccountCircleIcon from "@mui/icons-material/AccountCircle";
+import { useAuth } from "../context/AuthContext";
 
 function Header() {
+  const { user } = useAuth();
+
   return (
     <AppBar
       position="static"
@@ -99,7 +102,7 @@ function Header() {
                   lineHeight: 1.2,
                 }}
               >
-                Numa
+                {user?.name || "User"}
               </Typography>
 
               <Typography
