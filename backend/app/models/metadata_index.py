@@ -1,19 +1,34 @@
 from datetime import datetime, UTC
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import relationship
 
 from app.database.base import Base
 
 
-class MetadataTable(Base):
-    __tablename__ = "metadata_tables"
+class MetadataIndex(Base):
+    __tablename__ = "metadata_indexes"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
 
     user_id = Column(
         Integer,
-        ForeignKey("users.id", ondelete="CASCADE"),
+        ForeignKey(
+            "users.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
@@ -27,21 +42,27 @@ class MetadataTable(Base):
         nullable=False,
         index=True,
     )
-    schema_name = Column(
-    String(255),
-    nullable=False,
-    default="public",
-)
 
     table_name = Column(
         String(255),
         nullable=False,
     )
 
-    table_type = Column(
-        String(50),
+    index_name = Column(
+        String(255),
         nullable=False,
-        default="table",
+    )
+
+    columns = Column(
+        Text,
+        nullable=False,
+        default="",
+    )
+
+    unique = Column(
+        Boolean,
+        nullable=False,
+        default=False,
     )
 
     created_at = Column(
@@ -50,10 +71,8 @@ class MetadataTable(Base):
         nullable=False,
     )
 
-    user = relationship(
-        "User",
-    )
+    user = relationship("User")
 
     database_connection = relationship(
-        "DatabaseConnection",
+        "DatabaseConnection"
     )
