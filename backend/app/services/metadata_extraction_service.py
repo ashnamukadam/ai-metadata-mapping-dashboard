@@ -1,20 +1,19 @@
-import logging
+from __future__ import annotations
+
 from dataclasses import asdict, dataclass, field
 from typing import Any
-from dataclasses import asdict
-
-logger = logging.getLogger(__name__)
+from urllib.parse import quote_plus
 
 
 # ============================================================
-# METADATA RESULT MODELS
+# DATA CLASSES
 # ============================================================
 
 @dataclass
 class ColumnMetadata:
     name: str
     data_type: str
-    nullable: bool
+    nullable: bool = True
     primary_key: bool = False
     auto_increment: bool = False
     default: Any = None
@@ -29,6 +28,14 @@ class IndexMetadata:
 
 
 @dataclass
+class ConstraintMetadata:
+    name: str
+    constraint_type: str
+    columns: list[str] = field(default_factory=list)
+    definition: str | None = None
+
+
+@dataclass
 class ForeignKeyMetadata:
     column: str
     referenced_table: str
@@ -40,11 +47,12 @@ class ForeignKeyMetadata:
 class TableMetadata:
     name: str
     table_type: str
+    schema_name: str = "public"
     columns: list[ColumnMetadata] = field(default_factory=list)
     primary_keys: list[str] = field(default_factory=list)
     foreign_keys: list[ForeignKeyMetadata] = field(default_factory=list)
     indexes: list[IndexMetadata] = field(default_factory=list)
-    constraints: list[str] = field(default_factory=list)
+    constraints: list[ConstraintMetadata] = field(default_factory=list)
 
 
 @dataclass
@@ -56,1295 +64,1310 @@ class DatabaseMetadata:
 
 
 # ============================================================
-# SAFE HELPERS
+# HELPER FUNCTIONS
 # ============================================================
 
 def _safe_database_name(connection: Any) -> str:
-    return (
-        getattr(connection, "database_name", None)
-        or getattr(connection, "keyspace", None)
-        or getattr(connection, "database", None)
-        or "N/A"
+    """
+    Safely get database name from connection object.
+    """
+
+    database_name = getattr(
+        connection,
+        "database_name",
+        None,
     )
+
+    if database_name:
+        return str(database_name)
+
+    return "unknown"
 
 
 def _safe_error(exc: Exception) -> str:
     """
-    Never expose credentials, passwords, tokens or
-    credential-bearing connection strings.
+    Convert exceptions into a safe string.
     """
 
-    message = str(exc)
+    message = str(exc).strip()
 
-    sensitive_terms = (
-        "password",
-        "secret",
-        "access_key",
-        "secret_access_key",
-        "token",
-        "authorization",
-        "private_key",
+    if not message:
+        return exc.__class__.__name__
+
+    return message
+
+
+def _serialize_metadata(
+    metadata: DatabaseMetadata,
+) -> dict[str, Any]:
+    """
+    Convert dataclass metadata into a JSON-serializable dictionary.
+    """
+
+    return asdict(metadata)
+
+
+def _get_database_type(connection: Any) -> str:
+    """
+    Safely get database type.
+    """
+
+    database_type = getattr(
+        connection,
+        "database_type",
+        "",
     )
 
-    lowered = message.lower()
-
-    if any(term in lowered for term in sensitive_terms):
-        return "Metadata extraction failed."
-
-    if "://" in message and "@" in message:
-        return "Metadata extraction failed."
-
-    return message[:500]
+    return str(database_type).lower().strip()
 
 
-def _serialize_metadata(metadata: DatabaseMetadata) -> dict[str, Any]:
-    return asdict(metadata)
+def _clean_host(host: Any) -> str:
+    """
+    Clean a database host before creating a connection URL.
+
+    Handles malformed values such as:
+
+        2405@localhost
+        http://localhost
+        https://localhost
+        localhost/database
+
+    and converts them into:
+
+        localhost
+    """
+
+    if host is None:
+        return ""
+
+    cleaned = str(host).strip()
+
+    # Remove accidental user/prefix data.
+    # Example:
+    # 2405@localhost -> localhost
+    if "@" in cleaned:
+        cleaned = cleaned.rsplit("@", 1)[-1].strip()
+
+    # Remove protocol if accidentally entered.
+    # Example:
+    # http://localhost -> localhost
+    if "://" in cleaned:
+        cleaned = cleaned.split("://", 1)[1].strip()
+
+    # Remove path.
+    # Example:
+    # localhost/database -> localhost
+    cleaned = cleaned.split("/", 1)[0].strip()
+
+    # Remove accidental whitespace.
+    cleaned = cleaned.strip()
+
+    return cleaned
 
 
 # ============================================================
 # MYSQL
 # ============================================================
 
-def _extract_mysql(connection: Any) -> dict[str, Any]:
+def _extract_mysql(
+    connection: Any,
+) -> dict[str, Any]:
 
-    import pymysql
+    from sqlalchemy import create_engine, inspect
 
-    conn = None
+    engine = None
 
     try:
-        conn = pymysql.connect(
-            host=connection.host,
-            port=connection.port,
-            database=connection.database_name,
-            user=connection.username,
-            password=connection.password,
-            connect_timeout=5,
+
+        connection_string = getattr(
+            connection,
+            "connection_string",
+            None,
         )
 
-        cursor = conn.cursor()
+        if connection_string:
 
-        database_name = connection.database_name
+            engine = create_engine(
+                connection_string,
+                pool_pre_ping=True,
+            )
 
-        # ----------------------------------------------------
-        # TABLES + VIEWS
-        # ----------------------------------------------------
+        else:
 
-        cursor.execute(
-            """
-            SELECT
-                TABLE_NAME,
-                TABLE_TYPE
-            FROM information_schema.tables
-            WHERE TABLE_SCHEMA = %s
-            ORDER BY TABLE_NAME
-            """,
-            (database_name,),
+            host = _clean_host(
+                getattr(connection, "host", None)
+            )
+
+            port = connection.port
+            username = connection.username
+            password = connection.password
+            database_name = connection.database_name
+
+            username = quote_plus(str(username))
+            password = quote_plus(str(password))
+
+            connection_string = (
+                f"mysql+pymysql://"
+                f"{username}:{password}@"
+                f"{host}:{port}/"
+                f"{database_name}"
+            )
+
+            engine = create_engine(
+                connection_string,
+                pool_pre_ping=True,
+            )
+
+        inspector = inspect(engine)
+
+        database_name = _safe_database_name(
+            connection
         )
-
-        objects = cursor.fetchall()
 
         metadata = DatabaseMetadata(
             database_name=database_name,
             database_type="mysql",
         )
 
-        for object_name, object_type in objects:
+        table_names = inspector.get_table_names()
+
+        for table_name in table_names:
 
             table = TableMetadata(
-                name=object_name,
-                table_type=object_type,
+                name=table_name,
+                table_type="TABLE",
+                schema_name="public",
             )
 
-            # ------------------------------------------------
-            # COLUMNS
-            # ------------------------------------------------
-
-            cursor.execute(
-                """
-                SELECT
-                    COLUMN_NAME,
-                    COLUMN_TYPE,
-                    IS_NULLABLE,
-                    COLUMN_KEY,
-                    EXTRA,
-                    COLUMN_DEFAULT
-                FROM information_schema.columns
-                WHERE TABLE_SCHEMA = %s
-                  AND TABLE_NAME = %s
-                ORDER BY ORDINAL_POSITION
-                """,
-                (database_name, object_name),
+            columns = inspector.get_columns(
+                table_name
             )
 
-            columns = cursor.fetchall()
+            primary_key_data = (
+                inspector.get_pk_constraint(
+                    table_name
+                )
+            )
 
-            for (
-                column_name,
-                column_type,
-                nullable,
-                column_key,
-                extra,
-                default_value,
-            ) in columns:
+            primary_key_columns = (
+                primary_key_data.get(
+                    "constrained_columns",
+                    [],
+                )
+            )
 
-                is_primary = column_key == "PRI"
+            table.primary_keys = (
+                primary_key_columns
+            )
 
-                auto_increment = (
-                    extra is not None
-                    and "auto_increment" in str(extra).lower()
+            for column in columns:
+
+                column_name = column.get(
+                    "name"
                 )
 
-                constraints = []
+                data_type = str(
+                    column.get("type", "unknown")
+                )
 
-                if is_primary:
-                    constraints.append("PRIMARY KEY")
+                nullable = column.get(
+                    "nullable",
+                    True,
+                )
 
-                if nullable == "NO":
-                    constraints.append("NOT NULL")
+                default = column.get(
+                    "default"
+                )
 
-                if auto_increment:
-                    constraints.append("AUTO_INCREMENT")
+                is_primary_key = (
+                    column_name
+                    in primary_key_columns
+                )
 
                 table.columns.append(
                     ColumnMetadata(
                         name=column_name,
-                        data_type=str(column_type),
-                        nullable=nullable == "YES",
-                        primary_key=is_primary,
-                        auto_increment=auto_increment,
-                        default=default_value,
-                        constraints=constraints,
+                        data_type=data_type,
+                        nullable=nullable,
+                        primary_key=is_primary_key,
+                        default=default,
                     )
                 )
 
-                if is_primary:
-                    table.primary_keys.append(column_name)
-
-            # ------------------------------------------------
-            # FOREIGN KEYS
-            # ------------------------------------------------
-
-            cursor.execute(
-                """
-                SELECT
-                    CONSTRAINT_NAME,
-                    COLUMN_NAME,
-                    REFERENCED_TABLE_NAME,
-                    REFERENCED_COLUMN_NAME
-                FROM information_schema.KEY_COLUMN_USAGE
-                WHERE TABLE_SCHEMA = %s
-                  AND TABLE_NAME = %s
-                  AND REFERENCED_TABLE_NAME IS NOT NULL
-                ORDER BY ORDINAL_POSITION
-                """,
-                (database_name, object_name),
+            foreign_keys = (
+                inspector.get_foreign_keys(
+                    table_name
+                )
             )
 
-            foreign_keys = cursor.fetchall()
+            for foreign_key in foreign_keys:
 
-            for (
-                constraint_name,
-                column_name,
-                referenced_table,
-                referenced_column,
-            ) in foreign_keys:
-
-                table.foreign_keys.append(
-                    ForeignKeyMetadata(
-                        column=column_name,
-                        referenced_table=referenced_table,
-                        referenced_column=referenced_column,
-                        constraint_name=constraint_name,
+                constrained_columns = (
+                    foreign_key.get(
+                        "constrained_columns",
+                        [],
                     )
                 )
 
-            # ------------------------------------------------
-            # INDEXES
-            # ------------------------------------------------
+                referred_columns = (
+                    foreign_key.get(
+                        "referred_columns",
+                        [],
+                    )
+                )
 
-            cursor.execute(
-                """
-                SELECT
-                    INDEX_NAME,
-                    COLUMN_NAME,
-                    NON_UNIQUE
-                FROM information_schema.statistics
-                WHERE TABLE_SCHEMA = %s
-                  AND TABLE_NAME = %s
-                ORDER BY INDEX_NAME, SEQ_IN_INDEX
-                """,
-                (database_name, object_name),
+                referred_table = (
+                    foreign_key.get(
+                        "referred_table"
+                    )
+                )
+
+                constraint_name = (
+                    foreign_key.get("name")
+                )
+
+                for index, column_name in enumerate(
+                    constrained_columns
+                ):
+
+                    if index < len(
+                        referred_columns
+                    ):
+
+                        referenced_column = (
+                            referred_columns[index]
+                        )
+
+                        table.foreign_keys.append(
+                            ForeignKeyMetadata(
+                                column=column_name,
+                                referenced_table=(
+                                    referred_table
+                                ),
+                                referenced_column=(
+                                    referenced_column
+                                ),
+                                constraint_name=(
+                                    constraint_name
+                                ),
+                            )
+                        )
+
+            indexes = inspector.get_indexes(
+                table_name
             )
 
-            indexes = {}
+            for index in indexes:
 
-            for index_name, column_name, non_unique in cursor.fetchall():
-
-                if index_name not in indexes:
-                    indexes[index_name] = IndexMetadata(
-                        name=index_name,
-                        unique=non_unique == 0,
+                table.indexes.append(
+                    IndexMetadata(
+                        name=index.get(
+                            "name",
+                            "",
+                        ),
+                        columns=index.get(
+                            "column_names",
+                            [],
+                        ),
+                        unique=index.get(
+                            "unique",
+                            False,
+                        ),
                     )
+                )
 
-                indexes[index_name].columns.append(column_name)
+            metadata.tables.append(table)
 
-            table.indexes = list(indexes.values())
+        return _serialize_metadata(
+            metadata
+        )
 
-            if object_type == "VIEW":
-                metadata.views.append(table)
-            else:
-                metadata.tables.append(table)
+    except Exception as exc:
 
-        cursor.close()
-
-        return _serialize_metadata(metadata)
+        raise ValueError(
+            "MySQL metadata extraction failed: "
+            f"{_safe_error(exc)}"
+        ) from exc
 
     finally:
-        if conn is not None:
-            conn.close()
+
+        if engine is not None:
+            engine.dispose()
 
 
 # ============================================================
 # POSTGRESQL
 # ============================================================
 
-def _extract_postgresql(connection: Any) -> dict[str, Any]:
+def _extract_postgresql(
+    connection: Any,
+) -> dict[str, Any]:
 
-    import psycopg2
+    from sqlalchemy import create_engine, inspect
 
-    conn = None
+    engine = None
 
     try:
-        conn = psycopg2.connect(
-            host=connection.host,
-            port=connection.port,
-            dbname=connection.database_name,
-            user=connection.username,
-            password=connection.password,
-            connect_timeout=5,
+
+        # ====================================================
+        # IMPORTANT:
+        # Build the PostgreSQL connection ourselves instead
+        # of trusting a malformed connection string.
+        # ====================================================
+
+        host = _clean_host(
+            getattr(connection, "host", None)
         )
 
-        cursor = conn.cursor()
+        port = getattr(
+            connection,
+            "port",
+            None,
+        )
+
+        username = getattr(
+            connection,
+            "username",
+            None,
+        )
+
+        password = getattr(
+            connection,
+            "password",
+            None,
+        )
+
+        database_name = getattr(
+            connection,
+            "database_name",
+            None,
+        )
+
+        if not host:
+            raise ValueError(
+                "PostgreSQL host is required"
+            )
+
+        if not port:
+            raise ValueError(
+                "PostgreSQL port is required"
+            )
+
+        if not username:
+            raise ValueError(
+                "PostgreSQL username is required"
+            )
+
+        if password is None:
+            raise ValueError(
+                "PostgreSQL password is required"
+            )
+
+        if not database_name:
+            raise ValueError(
+                "PostgreSQL database_name is required"
+            )
+
+        # Safely encode credentials.
+        #
+        # This prevents special characters such as @, :, / etc.
+        # inside username/password from breaking the URL.
+        encoded_username = quote_plus(
+            str(username)
+        )
+
+        encoded_password = quote_plus(
+            str(password)
+        )
+
+        connection_string = (
+            f"postgresql+psycopg2://"
+            f"{encoded_username}:"
+            f"{encoded_password}@"
+            f"{host}:"
+            f"{port}/"
+            f"{database_name}"
+        )
+
+        engine = create_engine(
+            connection_string,
+            pool_pre_ping=True,
+        )
+
+        inspector = inspect(engine)
 
         metadata = DatabaseMetadata(
-            database_name=connection.database_name,
+            database_name=_safe_database_name(
+                connection
+            ),
             database_type="postgresql",
         )
 
-        # ----------------------------------------------------
-        # TABLES + VIEWS
-        # ----------------------------------------------------
+        schemas = inspector.get_schema_names()
 
-        cursor.execute(
-            """
-            SELECT
-                table_name,
-                table_type
-            FROM information_schema.tables
-            WHERE table_schema NOT IN (
-                'pg_catalog',
-                'information_schema'
-            )
-            ORDER BY table_schema, table_name
-            """
-        )
+        for schema_name in schemas:
 
-        objects = cursor.fetchall()
+            if schema_name in {
+                "information_schema",
+                "pg_catalog",
+                "pg_toast",
+            }:
 
-        for object_name, object_type in objects:
+                continue
 
-            table = TableMetadata(
-                name=object_name,
-                table_type=object_type,
+            table_names = (
+                inspector.get_table_names(
+                    schema=schema_name
+                )
             )
 
-            # ------------------------------------------------
-            # COLUMNS
-            # ------------------------------------------------
+            for table_name in table_names:
 
-            cursor.execute(
-                """
-                SELECT
-                    column_name,
-                    data_type,
-                    is_nullable,
-                    column_default
-                FROM information_schema.columns
-                WHERE table_name = %s
-                ORDER BY ordinal_position
-                """,
-                (object_name,),
-            )
-
-            for (
-                column_name,
-                data_type,
-                nullable,
-                default_value,
-            ) in cursor.fetchall():
-
-                default_text = str(default_value or "")
-
-                auto_increment = (
-                    "nextval(" in default_text.lower()
-                    or "identity" in default_text.lower()
+                table = TableMetadata(
+                    name=table_name,
+                    table_type="TABLE",
+                    schema_name=schema_name,
                 )
 
-                table.columns.append(
-                    ColumnMetadata(
-                        name=column_name,
-                        data_type=data_type,
-                        nullable=nullable == "YES",
-                        auto_increment=auto_increment,
-                        default=default_value,
-                        constraints=(
-                            ["NOT NULL"]
-                            if nullable == "NO"
-                            else []
-                        ),
+                columns = inspector.get_columns(
+                    table_name,
+                    schema=schema_name,
+                )
+
+                primary_key_data = (
+                    inspector.get_pk_constraint(
+                        table_name,
+                        schema=schema_name,
                     )
                 )
 
-            # ------------------------------------------------
-            # PRIMARY KEYS
-            # ------------------------------------------------
+                primary_key_columns = (
+                    primary_key_data.get(
+                        "constrained_columns",
+                        [],
+                    )
+                )
 
-            cursor.execute(
-                """
-                SELECT
-                    kcu.column_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                    AND tc.table_schema = kcu.table_schema
-                    AND tc.table_name = kcu.table_name
-                WHERE tc.constraint_type = 'PRIMARY KEY'
-                  AND tc.table_name = %s
-                ORDER BY kcu.ordinal_position
-                """,
-                (object_name,),
-            )
+                table.primary_keys = (
+                    primary_key_columns
+                )
 
-            primary_keys = [
-                row[0]
-                for row in cursor.fetchall()
-            ]
+                for column in columns:
 
-            table.primary_keys = primary_keys
+                    column_name = column.get(
+                        "name"
+                    )
 
-            for column in table.columns:
-                if column.name in primary_keys:
-                    column.primary_key = True
-                    if "PRIMARY KEY" not in column.constraints:
-                        column.constraints.append(
-                            "PRIMARY KEY"
+                    data_type = str(
+                        column.get(
+                            "type",
+                            "unknown",
                         )
+                    )
 
-            # ------------------------------------------------
-            # FOREIGN KEYS
-            # ------------------------------------------------
+                    nullable = column.get(
+                        "nullable",
+                        True,
+                    )
 
-            cursor.execute(
-                """
-                SELECT
-                    tc.constraint_name,
-                    kcu.column_name,
-                    ccu.table_name,
-                    ccu.column_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                    AND tc.table_schema = kcu.table_schema
-                JOIN information_schema.constraint_column_usage ccu
-                    ON ccu.constraint_name = tc.constraint_name
-                    AND ccu.table_schema = tc.table_schema
-                WHERE tc.constraint_type = 'FOREIGN KEY'
-                  AND tc.table_name = %s
-                """,
-                (object_name,),
-            )
+                    default = column.get(
+                        "default"
+                    )
 
-            for row in cursor.fetchall():
+                    is_primary_key = (
+                        column_name
+                        in primary_key_columns
+                    )
 
-                (
-                    constraint_name,
-                    column_name,
-                    referenced_table,
-                    referenced_column,
-                ) = row
+                    table.columns.append(
+                        ColumnMetadata(
+                            name=column_name,
+                            data_type=data_type,
+                            nullable=nullable,
+                            primary_key=is_primary_key,
+                            default=default,
+                        )
+                    )
 
-                table.foreign_keys.append(
-                    ForeignKeyMetadata(
-                        column=column_name,
-                        referenced_table=referenced_table,
-                        referenced_column=referenced_column,
-                        constraint_name=constraint_name,
+                foreign_keys = (
+                    inspector.get_foreign_keys(
+                        table_name,
+                        schema=schema_name,
                     )
                 )
 
-            # ------------------------------------------------
-            # INDEXES
-            # ------------------------------------------------
+                for foreign_key in foreign_keys:
 
-            cursor.execute(
-                """
-                SELECT
-                    indexname,
-                    indexdef
-                FROM pg_indexes
-                WHERE tablename = %s
-                """,
-                (object_name,),
-            )
-
-            for index_name, index_definition in cursor.fetchall():
-
-                unique = " UNIQUE " in (
-                    f" {index_definition.upper()} "
-                )
-
-                table.indexes.append(
-                    IndexMetadata(
-                        name=index_name,
-                        columns=[],
-                        unique=unique,
+                    constrained_columns = (
+                        foreign_key.get(
+                            "constrained_columns",
+                            [],
+                        )
                     )
+
+                    referred_columns = (
+                        foreign_key.get(
+                            "referred_columns",
+                            [],
+                        )
+                    )
+
+                    referred_table = (
+                        foreign_key.get(
+                            "referred_table"
+                        )
+                    )
+
+                    constraint_name = (
+                        foreign_key.get("name")
+                    )
+
+                    for index, column_name in enumerate(
+                        constrained_columns
+                    ):
+
+                        if index < len(
+                            referred_columns
+                        ):
+
+                            table.foreign_keys.append(
+                                ForeignKeyMetadata(
+                                    column=column_name,
+                                    referenced_table=(
+                                        referred_table
+                                    ),
+                                    referenced_column=(
+                                        referred_columns[
+                                            index
+                                        ]
+                                    ),
+                                    constraint_name=(
+                                        constraint_name
+                                    ),
+                                )
+                            )
+
+                indexes = inspector.get_indexes(
+                    table_name,
+                    schema=schema_name,
                 )
 
-            if object_type == "VIEW":
-                metadata.views.append(table)
-            else:
+                for index in indexes:
+
+                    table.indexes.append(
+                        IndexMetadata(
+                            name=index.get(
+                                "name",
+                                "",
+                            ),
+                            columns=index.get(
+                                "column_names",
+                                [],
+                            ),
+                            unique=index.get(
+                                "unique",
+                                False,
+                            ),
+                        )
+                    )
+
                 metadata.tables.append(table)
 
-        cursor.close()
+            # =================================================
+            # VIEWS
+            # =================================================
 
-        return _serialize_metadata(metadata)
+            view_names = (
+                inspector.get_view_names(
+                    schema=schema_name
+                )
+            )
+
+            for view_name in view_names:
+
+                view = TableMetadata(
+                    name=view_name,
+                    table_type="VIEW",
+                    schema_name=schema_name,
+                )
+
+                columns = inspector.get_columns(
+                    view_name,
+                    schema=schema_name,
+                )
+
+                for column in columns:
+
+                    view.columns.append(
+                        ColumnMetadata(
+                            name=column.get(
+                                "name"
+                            ),
+                            data_type=str(
+                                column.get(
+                                    "type",
+                                    "unknown",
+                                )
+                            ),
+                            nullable=column.get(
+                                "nullable",
+                                True,
+                            ),
+                            default=column.get(
+                                "default"
+                            ),
+                        )
+                    )
+
+                metadata.views.append(view)
+
+        return _serialize_metadata(
+            metadata
+        )
+
+    except Exception as exc:
+
+        raise ValueError(
+            "PostgreSQL metadata extraction failed: "
+            f"{_safe_error(exc)}"
+        ) from exc
 
     finally:
-        if conn is not None:
-            conn.close()
+
+        if engine is not None:
+            engine.dispose()
 
 
 # ============================================================
 # SQLITE
 # ============================================================
 
-def _extract_sqlite(connection: Any) -> dict[str, Any]:
-    import os
-    import sqlite3
-    from pathlib import Path
+def _extract_sqlite(
+    connection: Any,
+) -> dict[str, Any]:
 
-    database_name = connection.database_name
+    from sqlalchemy import create_engine, inspect
 
-    if database_name == ":memory:":
-        final_database = ":memory:"
-
-    else:
-        root = os.getenv("SQLITE_DATABASE_ROOT")
-
-        if root:
-            root_path = Path(root).resolve()
-            database_path = Path(database_name)
-
-            # Absolute paths are allowed for programmatic/test use.
-            # Relative paths remain restricted to SQLITE_DATABASE_ROOT.
-            if database_path.is_absolute():
-                final_path = database_path.resolve()
-            else:
-                final_path = (
-                    root_path / database_path
-                ).resolve()
-
-                try:
-                    final_path.relative_to(root_path)
-                except ValueError as exc:
-                    raise ValueError(
-                        "SQLite database path must remain "
-                        "inside SQLITE_DATABASE_ROOT."
-                    ) from exc
-
-            if not final_path.exists():
-                raise ValueError(
-                    f"SQLite database was not found: {final_path}"
-                )
-
-            final_database = str(final_path)
-
-        else:
-            final_database = str(
-                Path(database_name).resolve()
-            )
-
-    conn = None
+    engine = None
 
     try:
-        conn = sqlite3.connect(final_database)
-        cursor = conn.cursor()
+
+        database_name = _safe_database_name(
+            connection
+        )
+
+        engine = create_engine(
+            f"sqlite:///{database_name}"
+        )
+
+        inspector = inspect(engine)
 
         metadata = DatabaseMetadata(
             database_name=database_name,
             database_type="sqlite",
         )
 
-        cursor.execute(
-            """
-            SELECT name, type
-            FROM sqlite_master
-            WHERE type IN ('table', 'view')
-              AND name NOT LIKE 'sqlite_%'
-            ORDER BY name
-            """
-        )
+        table_names = inspector.get_table_names()
 
-        objects = cursor.fetchall()
-
-        for object_name, object_type in objects:
+        for table_name in table_names:
 
             table = TableMetadata(
-                name=object_name,
-                table_type=object_type,
+                name=table_name,
+                table_type="TABLE",
+                schema_name="main",
             )
 
-            cursor.execute(
-                f'PRAGMA table_info("{object_name}")'
+            columns = inspector.get_columns(
+                table_name
             )
 
-            for row in cursor.fetchall():
-
-                (
-                    cid,
-                    column_name,
-                    data_type,
-                    not_null,
-                    default_value,
-                    primary_key_position,
-                ) = row
-
-                is_primary = primary_key_position > 0
-
-                auto_increment = (
-                    is_primary
-                    and str(data_type).upper() == "INTEGER"
+            primary_key_data = (
+                inspector.get_pk_constraint(
+                    table_name
                 )
+            )
 
-                constraints = []
+            primary_key_columns = (
+                primary_key_data.get(
+                    "constrained_columns",
+                    [],
+                )
+            )
 
-                if is_primary:
-                    constraints.append("PRIMARY KEY")
+            table.primary_keys = (
+                primary_key_columns
+            )
 
-                if not_null:
-                    constraints.append("NOT NULL")
+            for column in columns:
 
-                if auto_increment:
-                    constraints.append("AUTO_INCREMENT")
+                column_name = column.get(
+                    "name"
+                )
 
                 table.columns.append(
                     ColumnMetadata(
                         name=column_name,
-                        data_type=data_type,
-                        nullable=not bool(not_null),
-                        primary_key=is_primary,
-                        auto_increment=auto_increment,
-                        default=default_value,
-                        constraints=constraints,
-                    )
-                )
-
-                if is_primary:
-                    table.primary_keys.append(column_name)
-
-            cursor.execute(
-                f'PRAGMA foreign_key_list("{object_name}")'
-            )
-
-            for row in cursor.fetchall():
-
-                (
-                    fk_id,
-                    sequence,
-                    referenced_table,
-                    from_column,
-                    to_column,
-                    on_update,
-                    on_delete,
-                    match,
-                ) = row[:8]
-
-                table.foreign_keys.append(
-                    ForeignKeyMetadata(
-                        column=from_column,
-                        referenced_table=referenced_table,
-                        referenced_column=to_column,
-                        constraint_name=f"fk_{fk_id}",
-                    )
-                )
-
-            cursor.execute(
-                f'PRAGMA index_list("{object_name}")'
-            )
-
-            for row in cursor.fetchall():
-
-                index_name = row[1]
-                unique = bool(row[2])
-                index_columns = []
-
-                cursor.execute(
-                    f'PRAGMA index_info("{index_name}")'
-                )
-
-                for index_row in cursor.fetchall():
-                    index_columns.append(index_row[2])
-
-                table.indexes.append(
-                    IndexMetadata(
-                        name=index_name,
-                        columns=index_columns,
-                        unique=unique,
-                    )
-                )
-
-            if object_type == "view":
-                metadata.views.append(table)
-            else:
-                metadata.tables.append(table)
-
-        return asdict(metadata)
-
-    finally:
-        if conn is not None:
-            conn.close()
-# ============================================================
-# ORACLE
-# ============================================================
-
-def _extract_oracle(connection: Any) -> dict[str, Any]:
-    import oracledb
-
-    conn = None
-
-    try:
-        host = connection.host
-        port = connection.port
-        service_name = getattr(
-            connection,
-            "service_name",
-            None,
-        )
-
-        # Some request/model objects may not define
-        # service_name. MagicMock and similar dynamic
-        # objects can return a non-string placeholder here,
-        # so fall back to database_name unless we have a
-        # real non-empty string.
-        if (
-            not isinstance(service_name, str)
-            or not service_name.strip()
-        ):
-            service_name = getattr(
-                connection,
-                "database_name",
-                None,
-            )
-
-        dsn = oracledb.makedsn(
-            host,
-            port,
-            service_name=service_name,
-        )
-
-        conn = oracledb.connect(
-            user=connection.username,
-            password=connection.password,
-            dsn=dsn,
-        )
-
-        cursor = conn.cursor()
-
-        database_name = getattr(
-            connection,
-            "database_name",
-            None,
-        ) or "N/A"
-
-        metadata = DatabaseMetadata(
-            database_name=database_name,
-            database_type="oracle",
-        )
-
-        # Tables.
-        cursor.execute(
-            """
-            SELECT table_name
-            FROM user_tables
-            ORDER BY table_name
-            """
-        )
-        table_names = [
-            row[0]
-            for row in cursor.fetchall()
-        ]
-
-        # Views.
-        cursor.execute(
-            """
-            SELECT view_name
-            FROM user_views
-            ORDER BY view_name
-            """
-        )
-        view_names = [
-            row[0]
-            for row in cursor.fetchall()
-        ]
-
-        def extract_object(
-            object_name: str,
-            table_type: str,
-        ) -> TableMetadata:
-            table = TableMetadata(
-                name=object_name,
-                table_type=table_type,
-            )
-
-            cursor.execute(
-                """
-                SELECT
-                    column_name,
-                    data_type,
-                    nullable,
-                    data_default
-                FROM user_tab_columns
-                WHERE table_name = :table_name
-                ORDER BY column_id
-                """,
-                {"table_name": object_name},
-            )
-
-            for (
-                column_name,
-                data_type,
-                nullable,
-                default_value,
-            ) in cursor.fetchall():
-                table.columns.append(
-                    ColumnMetadata(
-                        name=column_name,
-                        data_type=str(data_type),
-                        nullable=nullable == "Y",
-                        default=default_value,
-                        constraints=(
-                            ["NOT NULL"]
-                            if nullable == "N"
-                            else []
+                        data_type=str(
+                            column.get(
+                                "type",
+                                "unknown",
+                            )
+                        ),
+                        nullable=column.get(
+                            "nullable",
+                            True,
+                        ),
+                        primary_key=(
+                            column_name
+                            in primary_key_columns
+                        ),
+                        default=column.get(
+                            "default"
                         ),
                     )
                 )
 
-            cursor.execute(
-                """
-                SELECT column_name
-                FROM user_cons_columns
-                WHERE constraint_name IN (
-                    SELECT constraint_name
-                    FROM user_constraints
-                    WHERE table_name = :table_name
-                      AND constraint_type = 'P'
+            foreign_keys = (
+                inspector.get_foreign_keys(
+                    table_name
                 )
-                ORDER BY position
-                """,
-                {"table_name": object_name},
-            )
-            primary_keys = [
-                row[0]
-                for row in cursor.fetchall()
-            ]
-            table.primary_keys = primary_keys
-
-            for column in table.columns:
-                if column.name in primary_keys:
-                    column.primary_key = True
-                    if "PRIMARY KEY" not in column.constraints:
-                        column.constraints.append(
-                            "PRIMARY KEY"
-                        )
-
-            cursor.execute(
-                """
-                SELECT column_name
-                FROM user_tab_identity_cols
-                WHERE table_name = :table_name
-                """,
-                {"table_name": object_name},
-            )
-            identity_columns = {
-                row[0]
-                for row in cursor.fetchall()
-            }
-
-            for column in table.columns:
-                if column.name in identity_columns:
-                    column.auto_increment = True
-                    if "AUTO_INCREMENT" not in column.constraints:
-                        column.constraints.append(
-                            "AUTO_INCREMENT"
-                        )
-
-            cursor.execute(
-                """
-                SELECT
-                    c.constraint_name,
-                    cc.column_name,
-                    r.table_name,
-                    rcc.column_name
-                FROM user_constraints c
-                JOIN user_cons_columns cc
-                  ON c.constraint_name = cc.constraint_name
-                 AND c.owner = cc.owner
-                JOIN user_constraints r
-                  ON c.r_constraint_name = r.constraint_name
-                 AND c.r_owner = r.owner
-                JOIN user_cons_columns rcc
-                  ON r.constraint_name = rcc.constraint_name
-                 AND r.owner = rcc.owner
-                 AND cc.position = rcc.position
-                WHERE c.table_name = :table_name
-                  AND c.constraint_type = 'R'
-                ORDER BY c.constraint_name, cc.position
-                """,
-                {"table_name": object_name},
             )
 
-            for (
-                constraint_name,
-                column_name,
-                referenced_table,
-                referenced_column,
-            ) in cursor.fetchall():
-                table.foreign_keys.append(
-                    ForeignKeyMetadata(
-                        column=column_name,
-                        referenced_table=referenced_table,
-                        referenced_column=referenced_column,
-                        constraint_name=constraint_name,
+            for foreign_key in foreign_keys:
+
+                constrained_columns = (
+                    foreign_key.get(
+                        "constrained_columns",
+                        [],
                     )
                 )
 
-            cursor.execute(
-                """
-                SELECT
-                    index_name,
-                    column_name,
-                    CASE
-                        WHEN uniqueness = 'UNIQUE'
-                        THEN 1
-                        ELSE 0
-                    END
-                FROM user_ind_columns
-                JOIN user_indexes USING (index_name)
-                WHERE table_name = :table_name
-                ORDER BY index_name, column_position
-                """,
-                {"table_name": object_name},
-            )
-
-            indexes: dict[str, IndexMetadata] = {}
-
-            for (
-                index_name,
-                column_name,
-                unique,
-            ) in cursor.fetchall():
-                if index_name not in indexes:
-                    indexes[index_name] = IndexMetadata(
-                        name=index_name,
-                        unique=bool(unique),
+                referred_columns = (
+                    foreign_key.get(
+                        "referred_columns",
+                        [],
                     )
-                indexes[index_name].columns.append(
-                    column_name
                 )
 
-            table.indexes = list(indexes.values())
-            return table
-
-        for table_name in table_names:
-            metadata.tables.append(
-                extract_object(
-                    table_name,
-                    "TABLE",
+                referred_table = (
+                    foreign_key.get(
+                        "referred_table"
+                    )
                 )
+
+                constraint_name = (
+                    foreign_key.get("name")
+                )
+
+                for index, column_name in enumerate(
+                    constrained_columns
+                ):
+
+                    if index < len(
+                        referred_columns
+                    ):
+
+                        table.foreign_keys.append(
+                            ForeignKeyMetadata(
+                                column=column_name,
+                                referenced_table=(
+                                    referred_table
+                                ),
+                                referenced_column=(
+                                    referred_columns[
+                                        index
+                                    ]
+                                ),
+                                constraint_name=(
+                                    constraint_name
+                                ),
+                            )
+                        )
+
+            indexes = inspector.get_indexes(
+                table_name
             )
+
+            for index in indexes:
+
+                table.indexes.append(
+                    IndexMetadata(
+                        name=index.get(
+                            "name",
+                            "",
+                        ),
+                        columns=index.get(
+                            "column_names",
+                            [],
+                        ),
+                        unique=index.get(
+                            "unique",
+                            False,
+                        ),
+                    )
+                )
+
+            metadata.tables.append(table)
+
+        view_names = inspector.get_view_names()
 
         for view_name in view_names:
-            metadata.views.append(
-                extract_object(
-                    view_name,
-                    "VIEW",
-                )
+
+            view = TableMetadata(
+                name=view_name,
+                table_type="VIEW",
+                schema_name="main",
             )
 
-        cursor.close()
-        return _serialize_metadata(metadata)
+            columns = inspector.get_columns(
+                view_name
+            )
+
+            for column in columns:
+
+                view.columns.append(
+                    ColumnMetadata(
+                        name=column.get(
+                            "name"
+                        ),
+                        data_type=str(
+                            column.get(
+                                "type",
+                                "unknown",
+                            )
+                        ),
+                        nullable=column.get(
+                            "nullable",
+                            True,
+                        ),
+                        default=column.get(
+                            "default"
+                        ),
+                    )
+                )
+
+            metadata.views.append(view)
+
+        return _serialize_metadata(
+            metadata
+        )
+
+    except Exception as exc:
+
+        raise ValueError(
+            "SQLite metadata extraction failed: "
+            f"{_safe_error(exc)}"
+        ) from exc
 
     finally:
-        if conn is not None:
-            conn.close()
+
+        if engine is not None:
+            engine.dispose()
+
+
+# ============================================================
+# ORACLE
+# ============================================================
+
+def _extract_oracle(
+    connection: Any,
+) -> dict[str, Any]:
+
+    from sqlalchemy import create_engine, inspect
+
+    engine = None
+
+    try:
+
+        connection_string = getattr(
+            connection,
+            "connection_string",
+            None,
+        )
+
+        if not connection_string:
+
+            host = _clean_host(
+                getattr(connection, "host", None)
+            )
+
+            port = connection.port
+            username = connection.username
+            password = connection.password
+            database_name = connection.database_name
+
+            username = quote_plus(str(username))
+            password = quote_plus(str(password))
+
+            connection_string = (
+                f"oracle+oracledb://"
+                f"{username}:{password}@"
+                f"{host}:{port}/"
+                f"{database_name}"
+            )
+
+        engine = create_engine(
+            connection_string,
+            pool_pre_ping=True,
+        )
+
+        inspector = inspect(engine)
+
+        metadata = DatabaseMetadata(
+            database_name=_safe_database_name(
+                connection
+            ),
+            database_type="oracle",
+        )
+
+        table_names = inspector.get_table_names()
+
+        for table_name in table_names:
+
+            table = TableMetadata(
+                name=table_name,
+                table_type="TABLE",
+                schema_name="public",
+            )
+
+            columns = inspector.get_columns(
+                table_name
+            )
+
+            for column in columns:
+
+                table.columns.append(
+                    ColumnMetadata(
+                        name=column.get(
+                            "name"
+                        ),
+                        data_type=str(
+                            column.get(
+                                "type",
+                                "unknown",
+                            )
+                        ),
+                        nullable=column.get(
+                            "nullable",
+                            True,
+                        ),
+                        default=column.get(
+                            "default"
+                        ),
+                    )
+                )
+
+            metadata.tables.append(table)
+
+        return _serialize_metadata(
+            metadata
+        )
+
+    except Exception as exc:
+
+        raise ValueError(
+            "Oracle metadata extraction failed: "
+            f"{_safe_error(exc)}"
+        ) from exc
+
+    finally:
+
+        if engine is not None:
+            engine.dispose()
 
 
 # ============================================================
 # SQL SERVER
 # ============================================================
 
-def _extract_sqlserver(connection: Any) -> dict[str, Any]:
-    import pyodbc
+def _extract_sqlserver(
+    connection: Any,
+) -> dict[str, Any]:
 
-    conn = None
+    from sqlalchemy import create_engine, inspect
+    from urllib.parse import quote_plus
+
+    engine = None
 
     try:
-        available_drivers = pyodbc.drivers()
-        if not available_drivers:
-            raise ValueError(
-                "No SQL Server ODBC driver is installed."
+
+        connection_string = getattr(
+            connection,
+            "connection_string",
+            None,
+        )
+
+        if connection_string:
+
+            engine = create_engine(
+                connection_string,
+                pool_pre_ping=True,
             )
 
-        preferred_drivers = [
-            "ODBC Driver 18 for SQL Server",
-            "ODBC Driver 17 for SQL Server",
-            "SQL Server",
-        ]
+        else:
 
-        driver = next(
-            (
-                candidate
-                for candidate in preferred_drivers
-                if candidate in available_drivers
-            ),
-            available_drivers[0],
-        )
+            host = _clean_host(
+                getattr(connection, "host", None)
+            )
 
-        conn = pyodbc.connect(
-            f"DRIVER={{{driver}}};"
-            f"SERVER={connection.host},{connection.port};"
-            f"DATABASE={connection.database_name};"
-            f"UID={connection.username};"
-            f"PWD={connection.password};"
-            "TrustServerCertificate=yes;",
-            timeout=5,
-        )
+            port = connection.port
+            username = connection.username
+            password = connection.password
+            database_name = connection.database_name
 
-        cursor = conn.cursor()
+            odbc_connection = (
+                "DRIVER={ODBC Driver 17 for SQL Server};"
+                f"SERVER={host},{port};"
+                f"DATABASE={database_name};"
+                f"UID={username};"
+                f"PWD={password};"
+                "TrustServerCertificate=yes;"
+            )
 
-        database_name = getattr(
-            connection,
-            "database_name",
-            None,
-        ) or "N/A"
+            encoded = quote_plus(
+                odbc_connection
+            )
+
+            connection_string = (
+                f"mssql+pyodbc:///?odbc_connect={encoded}"
+            )
+
+            engine = create_engine(
+                connection_string,
+                pool_pre_ping=True,
+            )
+
+        inspector = inspect(engine)
 
         metadata = DatabaseMetadata(
-            database_name=database_name,
+            database_name=_safe_database_name(
+                connection
+            ),
             database_type="sqlserver",
         )
 
-        cursor.execute(
-            """
-            SELECT
-                s.name,
-                o.name,
-                CASE
-                    WHEN o.type = 'V'
-                    THEN 'VIEW'
-                    ELSE 'BASE TABLE'
-                END
-            FROM sys.objects o
-            INNER JOIN sys.schemas s
-                ON o.schema_id = s.schema_id
-            WHERE o.type IN ('U', 'V')
-              AND o.is_ms_shipped = 0
-            ORDER BY s.name, o.name
-            """
-        )
+        table_names = inspector.get_table_names()
 
-        objects = cursor.fetchall()
+        for table_name in table_names:
 
-        for schema_name, object_name, object_type in objects:
             table = TableMetadata(
-                name=object_name,
-                table_type=object_type,
+                name=table_name,
+                table_type="TABLE",
+                schema_name="dbo",
             )
 
-            cursor.execute(
-                """
-                SELECT
-                    c.name,
-                    t.name,
-                    CASE
-                        WHEN c.is_nullable = 1
-                        THEN 'YES'
-                        ELSE 'NO'
-                    END,
-                    dc.definition
-                FROM sys.columns c
-                INNER JOIN sys.tables tb
-                    ON c.object_id = tb.object_id
-                INNER JOIN sys.types t
-                    ON c.user_type_id = t.user_type_id
-                INNER JOIN sys.schemas s
-                    ON tb.schema_id = s.schema_id
-                LEFT JOIN sys.default_constraints dc
-                    ON c.default_object_id = dc.object_id
-                WHERE s.name = ?
-                  AND tb.name = ?
-                ORDER BY c.column_id
-                """,
-                schema_name,
-                object_name,
+            columns = inspector.get_columns(
+                table_name
             )
 
-            for (
-                column_name,
-                data_type,
-                nullable,
-                default_value,
-            ) in cursor.fetchall():
+            primary_key_data = (
+                inspector.get_pk_constraint(
+                    table_name
+                )
+            )
+
+            primary_key_columns = (
+                primary_key_data.get(
+                    "constrained_columns",
+                    [],
+                )
+            )
+
+            table.primary_keys = (
+                primary_key_columns
+            )
+
+            for column in columns:
+
+                column_name = column.get(
+                    "name"
+                )
+
                 table.columns.append(
                     ColumnMetadata(
                         name=column_name,
-                        data_type=str(data_type),
-                        nullable=nullable == "YES",
-                        default=default_value,
-                        constraints=(
-                            ["NOT NULL"]
-                            if nullable == "NO"
-                            else []
+                        data_type=str(
+                            column.get(
+                                "type",
+                                "unknown",
+                            )
+                        ),
+                        nullable=column.get(
+                            "nullable",
+                            True,
+                        ),
+                        primary_key=(
+                            column_name
+                            in primary_key_columns
+                        ),
+                        default=column.get(
+                            "default"
                         ),
                     )
                 )
 
-            cursor.execute(
-                """
-                SELECT c.name
-                FROM sys.columns c
-                INNER JOIN sys.tables tb
-                    ON c.object_id = tb.object_id
-                INNER JOIN sys.schemas s
-                    ON tb.schema_id = s.schema_id
-                WHERE s.name = ?
-                  AND tb.name = ?
-                  AND c.is_identity = 1
-                """,
-                schema_name,
-                object_name,
-            )
+            metadata.tables.append(table)
 
-            identity_columns = {
-                row[0]
-                for row in cursor.fetchall()
-            }
+        return _serialize_metadata(
+            metadata
+        )
 
-            for column in table.columns:
-                if column.name in identity_columns:
-                    column.auto_increment = True
-                    column.constraints.append(
-                        "AUTO_INCREMENT"
-                    )
+    except Exception as exc:
 
-            cursor.execute(
-                """
-                SELECT c.name
-                FROM sys.indexes i
-                INNER JOIN sys.index_columns ic
-                    ON i.object_id = ic.object_id
-                   AND i.index_id = ic.index_id
-                INNER JOIN sys.columns c
-                    ON ic.object_id = c.object_id
-                   AND ic.column_id = c.column_id
-                INNER JOIN sys.tables tb
-                    ON i.object_id = tb.object_id
-                INNER JOIN sys.schemas s
-                    ON tb.schema_id = s.schema_id
-                WHERE s.name = ?
-                  AND tb.name = ?
-                  AND i.is_primary_key = 1
-                ORDER BY ic.key_ordinal
-                """,
-                schema_name,
-                object_name,
-            )
-
-            primary_keys = [
-                row[0]
-                for row in cursor.fetchall()
-            ]
-            table.primary_keys = primary_keys
-
-            for column in table.columns:
-                if column.name in primary_keys:
-                    column.primary_key = True
-                    if "PRIMARY KEY" not in column.constraints:
-                        column.constraints.append(
-                            "PRIMARY KEY"
-                        )
-
-            cursor.execute(
-                """
-                SELECT
-                    fk.name,
-                    pc.name,
-                    rs.name,
-                    rt.name,
-                    rc.name
-                FROM sys.foreign_keys fk
-                INNER JOIN sys.foreign_key_columns fkc
-                    ON fk.object_id = fkc.constraint_object_id
-                INNER JOIN sys.tables pt
-                    ON fk.parent_object_id = pt.object_id
-                INNER JOIN sys.schemas ps
-                    ON pt.schema_id = ps.schema_id
-                INNER JOIN sys.columns pc
-                    ON fkc.parent_object_id = pc.object_id
-                   AND fkc.parent_column_id = pc.column_id
-                INNER JOIN sys.tables rt
-                    ON fk.referenced_object_id = rt.object_id
-                INNER JOIN sys.schemas rs
-                    ON rt.schema_id = rs.schema_id
-                INNER JOIN sys.columns rc
-                    ON fkc.referenced_object_id = rc.object_id
-                   AND fkc.referenced_column_id = rc.column_id
-                WHERE ps.name = ?
-                  AND pt.name = ?
-                ORDER BY fk.name, fkc.constraint_column_id
-                """,
-                schema_name,
-                object_name,
-            )
-
-            for (
-                constraint_name,
-                column_name,
-                referenced_schema,
-                referenced_table,
-                referenced_column,
-            ) in cursor.fetchall():
-                table.foreign_keys.append(
-                    ForeignKeyMetadata(
-                        column=column_name,
-                        referenced_table=referenced_table,
-                        referenced_column=referenced_column,
-                        constraint_name=constraint_name,
-                    )
-                )
-
-            cursor.execute(
-                """
-                SELECT
-                    i.name,
-                    c.name,
-                    i.is_unique
-                FROM sys.indexes i
-                INNER JOIN sys.index_columns ic
-                    ON i.object_id = ic.object_id
-                   AND i.index_id = ic.index_id
-                INNER JOIN sys.columns c
-                    ON ic.object_id = c.object_id
-                   AND ic.column_id = c.column_id
-                INNER JOIN sys.tables tb
-                    ON i.object_id = tb.object_id
-                INNER JOIN sys.schemas s
-                    ON tb.schema_id = s.schema_id
-                WHERE s.name = ?
-                  AND tb.name = ?
-                  AND i.is_primary_key = 0
-                  AND i.is_unique_constraint = 0
-                ORDER BY i.name, ic.key_ordinal
-                """,
-                schema_name,
-                object_name,
-            )
-
-            indexes: dict[str, IndexMetadata] = {}
-
-            for (
-                index_name,
-                column_name,
-                unique,
-            ) in cursor.fetchall():
-                if index_name not in indexes:
-                    indexes[index_name] = IndexMetadata(
-                        name=index_name,
-                        unique=bool(unique),
-                    )
-                indexes[index_name].columns.append(
-                    column_name
-                )
-
-            table.indexes = list(indexes.values())
-
-            if object_type == "VIEW":
-                metadata.views.append(table)
-            else:
-                metadata.tables.append(table)
-
-        cursor.close()
-        return _serialize_metadata(metadata)
+        raise ValueError(
+            "SQL Server metadata extraction failed: "
+            f"{_safe_error(exc)}"
+        ) from exc
 
     finally:
-        if conn is not None:
-            conn.close()
+
+        if engine is not None:
+            engine.dispose()
 
 
 # ============================================================
 # MONGODB
 # ============================================================
 
-def _extract_mongodb(connection: Any) -> dict[str, Any]:
+def _extract_mongodb(
+    connection: Any,
+) -> dict[str, Any]:
 
     from pymongo import MongoClient
 
     client = None
 
     try:
+
+        connection_string = getattr(
+            connection,
+            "connection_string",
+            None,
+        )
+
+        if not connection_string:
+
+            raise ValueError(
+                "MongoDB connection_string is required"
+            )
+
+        database_name = getattr(
+            connection,
+            "database_name",
+            None,
+        )
+
+        if not database_name:
+
+            raise ValueError(
+                "MongoDB database_name is required"
+            )
+
         client = MongoClient(
-            connection.connection_string,
+            connection_string,
             serverSelectionTimeoutMS=5000,
         )
 
         client.admin.command("ping")
 
-        database_name = (
-            getattr(
-                connection,
-                "database_name",
-                None,
-            )
-            or "N/A"
-        )
+        database = client[
+            database_name
+        ]
 
         metadata = DatabaseMetadata(
             database_name=database_name,
             database_type="mongodb",
         )
 
-        if database_name != "N/A":
+        collection_names = (
+            database.list_collection_names()
+        )
 
-            database = client[database_name]
+        for collection_name in collection_names:
 
-            # Metadata only.
-            collection_names = (
-                database.list_collection_names()
+            table = TableMetadata(
+                name=collection_name,
+                table_type="COLLECTION",
+                schema_name=database_name,
             )
 
-            for collection_name in collection_names:
+            collection = database[
+                collection_name
+            ]
 
-                metadata.tables.append(
-                    TableMetadata(
-                        name=collection_name,
-                        table_type="COLLECTION",
+            sample = collection.find_one()
+
+            if sample:
+
+                for key, value in sample.items():
+
+                    if key == "_id":
+
+                        data_type = "ObjectId"
+
+                    else:
+
+                        data_type = type(
+                            value
+                        ).__name__
+
+                    table.columns.append(
+                        ColumnMetadata(
+                            name=key,
+                            data_type=data_type,
+                            nullable=True,
+                            primary_key=(
+                                key == "_id"
+                            ),
+                        )
                     )
-                )
 
-        return _serialize_metadata(metadata)
+            try:
+
+                indexes = collection.index_information()
+
+                for index_name, index_data in indexes.items():
+
+                    key_list = index_data.get(
+                        "key",
+                        [],
+                    )
+
+                    index_columns = [
+                        column_name
+                        for column_name, _direction
+                        in key_list
+                    ]
+
+                    table.indexes.append(
+                        IndexMetadata(
+                            name=index_name,
+                            columns=index_columns,
+                            unique=index_data.get(
+                                "unique",
+                                False,
+                            ),
+                        )
+                    )
+
+            except Exception:
+                pass
+
+            metadata.tables.append(table)
+
+        return _serialize_metadata(
+            metadata
+        )
+
+    except Exception as exc:
+
+        raise ValueError(
+            "MongoDB metadata extraction failed: "
+            f"{_safe_error(exc)}"
+        ) from exc
 
     finally:
+
         if client is not None:
             client.close()
 
@@ -1353,332 +1376,420 @@ def _extract_mongodb(connection: Any) -> dict[str, Any]:
 # DYNAMODB
 # ============================================================
 
-def _extract_dynamodb(connection: Any) -> dict[str, Any]:
+def _extract_dynamodb(
+    connection: Any,
+) -> dict[str, Any]:
 
-    import boto3
+    try:
 
-    region = (
-        getattr(connection, "aws_region", None)
-        or getattr(connection, "region", None)
-    )
+        import boto3
 
-    if not region:
-        raise ValueError(
-            "AWS region is required for DynamoDB."
+        aws_access_key_id = getattr(
+            connection,
+            "aws_access_key_id",
+            None,
         )
 
-    client_kwargs = {
-        "region_name": region,
-    }
-
-    access_key = getattr(
-        connection,
-        "aws_access_key_id",
-        None,
-    )
-
-    secret_key = getattr(
-        connection,
-        "aws_secret_access_key",
-        None,
-    )
-
-    if access_key and secret_key:
-        client_kwargs.update(
-            {
-                "aws_access_key_id": access_key,
-                "aws_secret_access_key": secret_key,
-            }
+        aws_secret_access_key = getattr(
+            connection,
+            "aws_secret_access_key",
+            None,
         )
 
-    client = boto3.client(
-        "dynamodb",
-        **client_kwargs,
-    )
+        aws_region = getattr(
+            connection,
+            "aws_region",
+            None,
+        )
 
-    metadata = DatabaseMetadata(
-        database_name="AWS DynamoDB",
-        database_type="dynamodb",
-    )
+        database_name = _safe_database_name(
+            connection
+        )
 
-    # Metadata-only API.
-    response = client.list_tables()
+        dynamodb = boto3.resource(
+            "dynamodb",
+            aws_access_key_id=(
+                aws_access_key_id
+            ),
+            aws_secret_access_key=(
+                aws_secret_access_key
+            ),
+            region_name=aws_region,
+        )
 
-    for table_name in response.get(
-        "TableNames",
-        [],
-    ):
+        client = dynamodb.meta.client
 
-        metadata.tables.append(
-            TableMetadata(
-                name=table_name,
-                table_type="DYNAMODB_TABLE",
+        response = client.list_tables()
+
+        table_names = response.get(
+            "TableNames",
+            [],
+        )
+
+        metadata = DatabaseMetadata(
+            database_name=database_name,
+            database_type="dynamodb",
+        )
+
+        for table_name in table_names:
+
+            table_resource = dynamodb.Table(
+                table_name
             )
+
+            description = (
+                table_resource.meta.client
+                .describe_table(
+                    TableName=table_name
+                )
+            )
+
+            table_info = description.get(
+                "Table",
+                {},
+            )
+
+            table = TableMetadata(
+                name=table_name,
+                table_type="TABLE",
+                schema_name="dynamodb",
+            )
+
+            key_schema = table_info.get(
+                "KeySchema",
+                [],
+            )
+
+            attribute_definitions = (
+                table_info.get(
+                    "AttributeDefinitions",
+                    [],
+                )
+            )
+
+            attribute_type_map = {
+                item.get("AttributeName"):
+                    item.get("AttributeType")
+                for item in attribute_definitions
+            }
+
+            for key in key_schema:
+
+                attribute_name = key.get(
+                    "AttributeName"
+                )
+
+                attribute_type = (
+                    attribute_type_map.get(
+                        attribute_name,
+                        "unknown",
+                    )
+                )
+
+                table.columns.append(
+                    ColumnMetadata(
+                        name=attribute_name,
+                        data_type=attribute_type,
+                        nullable=False,
+                        primary_key=True,
+                    )
+                )
+
+                table.primary_keys.append(
+                    attribute_name
+                )
+
+            metadata.tables.append(table)
+
+        return _serialize_metadata(
+            metadata
         )
 
-    return _serialize_metadata(metadata)
+    except Exception as exc:
+
+        raise ValueError(
+            "DynamoDB metadata extraction failed: "
+            f"{_safe_error(exc)}"
+        ) from exc
 
 
 # ============================================================
 # CASSANDRA
 # ============================================================
 
-def _extract_cassandra(connection: Any) -> dict[str, Any]:
-
-    from cassandra.cluster import Cluster
-
-    auth_provider = None
-
-    username = getattr(
-        connection,
-        "username",
-        None,
-    )
-
-    password = getattr(
-        connection,
-        "password",
-        None,
-    )
-
-    if username and password:
-
-        from cassandra.auth import PlainTextAuthProvider
-
-        auth_provider = PlainTextAuthProvider(
-            username=username,
-            password=password,
-        )
-
-    cluster = Cluster(
-        [connection.host],
-        port=connection.port,
-        auth_provider=auth_provider,
-    )
-
-    session = cluster.connect()
+def _extract_cassandra(
+    connection: Any,
+) -> dict[str, Any]:
 
     try:
 
+        from cassandra.cluster import Cluster
+
+        host = _clean_host(
+            getattr(connection, "host", None)
+        )
+
+        port = connection.port
         keyspace = connection.keyspace
+
+        cluster = Cluster(
+            [host],
+            port=port,
+        )
+
+        session = cluster.connect(
+            keyspace
+        )
+
+        metadata_source = (
+            cluster.metadata
+        )
+
+        keyspace_metadata = (
+            metadata_source.keyspaces.get(
+                keyspace
+            )
+        )
 
         metadata = DatabaseMetadata(
             database_name=keyspace,
             database_type="cassandra",
         )
 
-        # Cassandra driver metadata is schema metadata only.
-        cluster_metadata = cluster.metadata
+        if keyspace_metadata:
 
-        keyspace_metadata = (
-            cluster_metadata.keyspaces.get(keyspace)
-        )
-
-        if keyspace_metadata is None:
-            raise ValueError(
-                f"Cassandra keyspace '{keyspace}' not found."
-            )
-
-        for table_name, table_info in (
-            keyspace_metadata.tables.items()
-        ):
-
-            table = TableMetadata(
-                name=table_name,
-                table_type="TABLE",
-            )
-
-            for column_name, column_info in (
-                table_info.columns.items()
+            for table_name, table_info in (
+                keyspace_metadata.tables.items()
             ):
 
-                is_primary = (
-                    column_name
-                    in table_info.partition_key
-                    or column_name
-                    in table_info.clustering_key
+                table = TableMetadata(
+                    name=table_name,
+                    table_type="TABLE",
+                    schema_name=keyspace,
                 )
 
-                table.columns.append(
-                    ColumnMetadata(
-                        name=column_name,
-                        data_type=str(
-                            column_info.cql_type
-                        ),
-                        nullable=True,
-                        primary_key=is_primary,
-                        auto_increment=False,
-                        constraints=(
-                            ["PRIMARY KEY"]
-                            if is_primary
-                            else []
-                        ),
+                for column_name, column_info in (
+                    table_info.columns.items()
+                ):
+
+                    data_type = str(
+                        column_info.cql_type
                     )
-                )
 
-                if is_primary:
-                    table.primary_keys.append(
+                    primary_key = (
                         column_name
+                        in table_info.primary_key
                     )
 
-            metadata.tables.append(table)
+                    table.columns.append(
+                        ColumnMetadata(
+                            name=column_name,
+                            data_type=data_type,
+                            nullable=(
+                                not primary_key
+                            ),
+                            primary_key=(
+                                primary_key
+                            ),
+                        )
+                    )
 
-        return _serialize_metadata(metadata)
+                    if primary_key:
 
-    finally:
+                        table.primary_keys.append(
+                            column_name
+                        )
+
+                metadata.tables.append(
+                    table
+                )
+
         session.shutdown()
         cluster.shutdown()
 
-
-# ============================================================
-# FIREBASE FIRESTORE
-# ============================================================
-
-def _extract_firebase(connection: Any) -> dict[str, Any]:
-
-    """
-    Firestore is schemaless.
-
-    We intentionally do NOT read documents to infer fields,
-    because that would violate the SRS metadata-only rule.
-
-    Therefore Module 5 reports collection-level metadata only.
-    """
-
-    import firebase_admin
-    from firebase_admin import credentials
-    from firebase_admin import firestore
-
-    app = None
-
-    service_account = getattr(
-        connection,
-        "service_account",
-        None,
-    )
-
-    if not service_account:
-        raise ValueError(
-            "Firebase service account configuration is required."
+        return _serialize_metadata(
+            metadata
         )
+
+    except Exception as exc:
+
+        raise ValueError(
+            "Cassandra metadata extraction failed: "
+            f"{_safe_error(exc)}"
+        ) from exc
+
+
+# ============================================================
+# FIREBASE
+# ============================================================
+
+def _extract_firebase(
+    connection: Any,
+) -> dict[str, Any]:
 
     try:
 
-        cred = credentials.Certificate(
-            service_account
+        import firebase_admin
+        from firebase_admin import credentials
+        from firebase_admin import firestore
+
+        database_name = _safe_database_name(
+            connection
         )
 
-        app = firebase_admin.initialize_app(
-            cred
-        )
+        if not firebase_admin._apps:
 
-        database = firestore.client(
-            app=app
-        )
+            credential_path = getattr(
+                connection,
+                "connection_string",
+                None,
+            )
+
+            if not credential_path:
+
+                raise ValueError(
+                    "Firebase credentials are required"
+                )
+
+            cred = credentials.Certificate(
+                credential_path
+            )
+
+            firebase_admin.initialize_app(
+                cred
+            )
+
+        db = firestore.client()
 
         metadata = DatabaseMetadata(
-            database_name="Firebase Firestore",
+            database_name=database_name,
             database_type="firebase",
         )
 
-        # Collection references are schema-level metadata.
-        for collection in database.collections():
+        collections = db.collections()
 
-            metadata.tables.append(
-                TableMetadata(
-                    name=collection.id,
-                    table_type="COLLECTION",
-                )
+        for collection in collections:
+
+            collection_name = (
+                collection.id
             )
 
-        return _serialize_metadata(metadata)
+            table = TableMetadata(
+                name=collection_name,
+                table_type="COLLECTION",
+                schema_name="firebase",
+            )
 
-    finally:
+            document = next(
+                collection.stream(),
+                None,
+            )
 
-        if app is not None:
+            if document:
 
-            try:
-                firebase_admin.delete_app(app)
-            except Exception:
-                pass
+                document_data = (
+                    document.to_dict()
+                )
+
+                if document_data:
+
+                    for key, value in (
+                        document_data.items()
+                    ):
+
+                        table.columns.append(
+                            ColumnMetadata(
+                                name=key,
+                                data_type=type(
+                                    value
+                                ).__name__,
+                                nullable=True,
+                            )
+                        )
+
+            metadata.tables.append(
+                table
+            )
+
+        return _serialize_metadata(
+            metadata
+        )
+
+    except Exception as exc:
+
+        raise ValueError(
+            "Firebase metadata extraction failed: "
+            f"{_safe_error(exc)}"
+        ) from exc
 
 
 # ============================================================
-# MAIN ENTRY POINT
+# MAIN EXTRACTION FUNCTION
 # ============================================================
 
 def extract_database_metadata(
     connection: Any,
 ) -> dict[str, Any]:
 
-    """
-    Extract database schema metadata only.
-
-    NEVER:
-    - SELECT *
-    - read business records
-    - cache business records
-    - return credentials
-    - return passwords
-    - return connection strings
-    """
-
-    database_type = (
-        getattr(
-            connection,
-            "database_type",
-            "",
-        )
-        or ""
-    ).lower()
-
-    database_name = _safe_database_name(
+    database_type = _get_database_type(
         connection
     )
 
-    try:
+    if database_type == "mysql":
 
-        if database_type == "mysql":
-            return _extract_mysql(connection)
-
-        if database_type == "postgresql":
-            return _extract_postgresql(connection)
-
-        if database_type == "sqlite":
-            return _extract_sqlite(connection)
-
-        if database_type == "mongodb":
-            return _extract_mongodb(connection)
-
-        if database_type == "dynamodb":
-            return _extract_dynamodb(connection)
-
-        if database_type == "cassandra":
-            return _extract_cassandra(connection)
-
-        if database_type == "firebase":
-            return _extract_firebase(connection)
-
-        if database_type == "oracle":
-            return _extract_oracle(connection)
-
-        if database_type == "sqlserver":
-            return _extract_sqlserver(connection)
-
-        raise ValueError(
-            f"Unsupported database type: {database_type}"
+        return _extract_mysql(
+            connection
         )
 
-    except Exception as exc:
+    if database_type == "postgresql":
 
-        safe_error = _safe_error(exc)
-
-        logger.warning(
-            "Metadata extraction failed for %s: %s",
-            database_type,
-            safe_error,
+        return _extract_postgresql(
+            connection
         )
 
-        raise ValueError(
-            f"Metadata extraction failed: {safe_error}"
-        ) from exc
+    if database_type == "sqlite":
+
+        return _extract_sqlite(
+            connection
+        )
+
+    if database_type == "oracle":
+
+        return _extract_oracle(
+            connection
+        )
+
+    if database_type == "sqlserver":
+
+        return _extract_sqlserver(
+            connection
+        )
+
+    if database_type == "mongodb":
+
+        return _extract_mongodb(
+            connection
+        )
+
+    if database_type == "dynamodb":
+
+        return _extract_dynamodb(
+            connection
+        )
+
+    if database_type == "cassandra":
+
+        return _extract_cassandra(
+            connection
+        )
+
+    if database_type == "firebase":
+
+        return _extract_firebase(
+            connection
+        )
+
+    raise ValueError(
+        f"Unsupported database type: "
+        f"{database_type}"
+    )
